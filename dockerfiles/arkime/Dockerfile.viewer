@@ -1,36 +1,43 @@
 FROM ubuntu:22.04
 
-    ARG ARKIME_VERSION=4.2.0 # Specify Arkime version
-    ENV DEBIAN_FRONTEND=noninteractive
+ARG ARKIME_VERSION=4.2.0
+ENV DEBIAN_FRONTEND=noninteractive
 
-    RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
-        # Arkime Viewer dependencies
         nodejs \
         npm \
-        # Other Arkime runtime deps if any
         libpcap0.8 \
         libmaxminddb0 \
-        libyaml-0-2 \
-        && rm -rf /var/lib/apt/lists/*
-    
-    # Download and install Arkime DEB
-    # The URL might change based on version and OS. This is an example.
-    RUN wget https://s3.amazonaws.com/files.molo.ch/builds/ubuntu-22.04/arkime_${ARKIME_VERSION}-1_amd64.deb -O /tmp/arkime.deb \
-        && apt-get update \
-        && apt-get install -y /tmp/arkime.deb \
-        && rm /tmp/arkime.deb
+        libyaml-0-2 && \
+    rm -rf /var/lib/apt/lists/*
 
-    # Ensure config directory exists (config.ini will be volume-mounted)
-    RUN mkdir -p /opt/arkime/etc
-    RUN mkdir -p /data/pcap # PCAP directory
+# Download and install Arkime DEB package
+RUN wget "https://s3.amazonaws.com/files.molo.ch/builds/ubuntu-22.04/arkime_${ARKIME_VERSION}-1_amd64.deb" -O /tmp/arkime.deb && \
+    apt-get update && \
+    apt-get install -y /tmp/arkime.deb && \
+    rm /tmp/arkime.deb
 
-    WORKDIR /opt/arkime/bin
-    EXPOSE 8005
-    CMD ["/opt/arkime/bin/node", "/opt/arkime/viewer/viewer.js", "-c", "/opt/arkime/etc/config.ini", "--host", "0.0.0.0"]
+# Create necessary directories if they don't exist (though Arkime package should create /opt/arkime/etc)
+RUN mkdir -p /opt/arkime/etc && \
+    mkdir -p /data/pcap # PCAP directory, though viewer primarily reads from it
 
-    # Verify viewer installation and node modules
-    # This helps catch issues where the .deb package might not have installed everything correctly.
-    # In a production environment, consider more robust health checks.
-    RUN /opt/arkime/bin/node /opt/arkime/viewer/viewer.js --version || echo "Arkime viewer installation or node modules might be incomplete."
+WORKDIR /opt/arkime/bin
+
+# Expose the default Arkime viewer port
+EXPOSE 8005
+
+# Healthcheck to verify the viewer is responding
+# This is a basic check; a more thorough one might query an API endpoint if available without auth.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8005/api/molochclusters || exit 1
+
+# Default command to start the Arkime viewer
+# Configuration file (-c) will be volume-mounted.
+# Listening on 0.0.0.0 to be accessible from outside the container (via mapped port).
+CMD ["/opt/arkime/bin/node", "/opt/arkime/viewer/viewer.js", "-c", "/opt/arkime/etc/config.ini", "--host", "0.0.0.0"]
+
+# Verification step (optional, but good for build-time check)
+# RUN /opt/arkime/bin/node /opt/arkime/viewer/viewer.js --version

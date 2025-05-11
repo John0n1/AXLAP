@@ -1,9 +1,13 @@
 # axlap/config/zeek/plugin_configs/example_plugin.yaml
 plugin_name: AXLAP_HTTP_Detailed.zeek
 enabled: true
-description: "Logs extended HTTP details including all headers."
+description: "Logs extended HTTP details including all headers and MD5 hashes of bodies."
+
+# These settings correspond to redefinable options in the AXLAP_HTTP_Detailed.zeek script.
+# The TUI could potentially read this file, allow users to modify these values,
+# and then regenerate or update a Zeek local/loader script to apply them.
 settings:
-  log_all_headers: true
-  max_header_length: 8192 # Increased max header length
-# These settings would be read by the TUI and could be used to modify
-# `local.zeek` or a dedicated plugin loader script in Zeek.
+  log_all_request_headers: true
+  log_all_response_headers: true
+  max_header_value_len: 2048 # Increased from default 1024, ensure Zeek script handles this
+  # log_http_bodies: false # Example: if this option existed in the Zeek script

@@ -10,113 +10,49 @@ HOME_NET: "${HOME_NETS_CONFIG_SURICATA}" # Example, will be dynamic
 # Path to rules
 default-rule-path: /etc/suricata/rules/
 rule-files:
-  - suricata.rules # This is usually the combined rules file from suricata-update
-  - local.rules    # For AXLAP custom rules, consider more specific path like /etc/suricata/rules/local.rules
+  - suricata.rules # Main rules file from suricata-update
+  - local.rules    # Custom AXLAP rules, path relative to default-rule-path
 
 # Output configuration
 outputs:
   # EVE JSON log based output
   - eve-log:
       enabled: yes
-      filetype: regular # regular|syslog|unix_dgram|unix_stream|redis
+      filetype: regular
       filename: eve.json # Output to /var/log/suricata/eve.json
-      # Buffering
-      # buffer-size: 64kb # commented out to use default
-      # flush-interval: 1s # new setting in 6.0.7+, default 1s
-      # rotate-interval: day # new in 6.0.5+, rotate daily. Set to 'file' to disable time based rotation.
-      # archive: true # new in 6.0.11+, archive rotated files
-      # archive-max-files: 5 # new in 6.0.11+, max archived files
-      #xff:
-      #  enabled: yes
-      #  mode: extra-data # Differentiate between real client ip and proxies
-      #  deployment: reverse
-      #  header: X-Forwarded-For
-      # Payload printing
-      #payload-printable: yes
-      # Packet printing
-      #packet-printable: yes
-      # http header logging
-      #http-log-headers:
-      #  # Log specific headers. Case insensitive.
-      #  # "Authorization": any # Log 'Authorization' header if it is part of the HTTP request.
-      #  # "Cookie": request # Log 'Cookie' header for HTTP requests only.
-      #  # "Set-Cookie": response # Log 'Set-Cookie' header for HTTP responses only.
       types:
         - alert:
-            # payload: yes             # Output payload with alert. Default: no
-            # payload-buffer-size: 4kb # Output payload buffer size. Default: 4kb
-            # payload-printable: yes   # Output payload in printable format. Default: yes
-            # packet: yes              # Output packet with alert. Default: no
-            # http-body: yes           # Output HTTP body with alert. Default: no
-            # http-body-printable: yes # Output HTTP body in printable format. Default: yes
-            # http-header: yes         # Output HTTP header with alert. Default: no
-            # tagged-packets: yes      # Output tagged packets for alerts. Default: no
-            # metadata: yes            # Output alert metadata. Default: yes (since 6.0.0)
-            # rule-vars: yes           # Output rule vars. Default: yes (since 6.0.4)
+            tagged-packets: yes      # Log packets that are tagged by rules (e.g., for packet capture related to an alert)
+            metadata: yes            # Include rule metadata (e.g., cve, mitre_tactic_id if present in rule)
+            rule-vars: yes           # Output rule variables (e.g., flowbits, counters)
         - http:
-            extended: yes     # To include all HTTP request and response fields
-            # custom: [Accept-Language, Accept-Encoding] # Enable specific fields
+            extended: yes     # Include all HTTP request and response fields
         - dns:
-            # query: yes
-            # answer: yes
-            # version: 2 # Enable version 2 for more detailed information
+            query: yes        # Log DNS query
+            answer: yes       # Log DNS answer
+            version: 2        # Use DNS log format v2 for more details
         - tls:
-            extended: yes     # To include all TLS logging fields
+            extended: yes     # Include all TLS logging fields (JA3/JA3S hashes, SNI, etc.)
         - files:
-            force-magic: no   # Force logging of magic for all stored files
-            force-md5: no     # Force logging of MD5 for all stored files
-            # custom: [custom field1, custom field2] # Enable specific fields
+            force-magic: no   # Only log magic if available, don't force calculation
+            force-md5: no     # Only log MD5 if available
         - drop: {}
         - flow: {}
-        - netflow: {} # Requires netflow app-layer
+        - netflow: {} # Requires netflow app-layer enabled
         - ssh: {}
         - smtp: {}
-        # - stats:
-        #     totals: yes       # stats for all threads merged together
-        #     threads: no       # per thread stats
-        #     deltas: no        # deltas for counters
-        # - dnp3: {}
-        # - nfs: {}
-        # - smb: {}
-        # - tftp: {}
-        # - rdp: {}
-        # - krb5: {}
-        # - ikev2: {}
-        # - dhcp: {}
-        # - rfb: {}
-        # - snmp: {}
-        # - mqtt: {}
-        # - http2: {}
-        # - geneve: {}
-        # - quic: {}
 
 # AF_PACKET settings for capture interface (example for eth0)
 af-packet:
   - interface: ${SURICATA_INTERFACE_FROM_ENV:-eth0} # Will be replaced by install.sh or Docker env
-    # Number of receive threads. If you run a 16 core machine
-    # 2 threads for flow, 16-2-X for workers seems a good start.
-    # threads: auto means number of cores.
-    # threads: 1
-    # Default cluster_id is 0. If you run multiple Suricata instances on the same interface,
-    # you must give each a unique cluster_id.
-    cluster-id: 99
-    cluster-type: cluster_flow # Default. Other options: cluster_cpu, cluster_qm
-    # When using RSS (Receive Side Scaling), some cards need specific settings.
-    # For example, some Intel cards need "defrag: no"
+    cluster-id: 99 # Unique ID if running multiple Suricata instances on the same interface
+    cluster-type: cluster_flow # Distribute flows based on hash
     defrag: yes
-    # buffer-size: 32768 # Default is kernel default
-    # Ring size. Default value is 131072. Value is number of packets.
-    # Ring size must be a power of 2.
-    # ring-size: 262144
-    use-mmap: yes # Use mmaped capture. Mutually exclusive with copy-mode.
-    # BPF filter to apply to this interface.
-    # bpf-filter: not (host 1.2.3.4 and port 80)
-    # promiscuous: yes # Default yes
-    # checksum-validation: yes # Default yes, set to no for some NICs/drivers
+    use-mmap: yes
 
 # Engine settings
-# detect-engine:
-#   - rule-reload: true # Auto reload rules on SIGHUP
+detect-engine:
+  - rule-reload: true # Enable SIGHUP to reload rules without restarting Suricata
 
 # Host OS specific settings.
 # Linux
@@ -125,22 +61,15 @@ af-packet:
 # Or use the cpu_affinity settings below.
 
 cpu-affinity:
-  # Management thread(s). Default: no affinity.
+  # These settings are highly dependent on the specific hardware and workload.
+  # Default is no affinity, kernel scheduler handles it.
+  # Test thoroughly if enabling specific affinities.
   # management-cpu-set:
-  #   cpu: [ "0" ]  # Use only CPU 0.
-  # Receive thread(s). Default: no affinity.
-  # receive-cpu-set:
-  #   cpu: [ "0" ]  # Use only CPU 0.
-  # Worker thread(s). Default: no affinity.
+  #   cpu: [ "0" ]
+  # receive-cpu-set: # For af-packet, often tied to NIC RSS queues
+  #   cpu: [ "0", "1" ]
   # worker-cpu-set:
-  #   cpu: [ "all" ] # Use all CPUs.
-  #   mode: "exclusive" # "exclusive" or "shared". In "exclusive" mode, each worker will be pinned to a CPU.
-  #                     # If the number of CPUs is less than number of workers, the pinning will wrap around.
+  #   cpu: [ "all" ] # Use all available cores for worker threads
+  #   mode: "exclusive" # Pin each worker to a CPU core if possible
   #   prio:
-  #     default: "medium" # Default "low", "medium", "high", "max" or numerical value.
-  # verdict-cpu-set:
-  #   cpu: ["1"]
-  #   prio:
-  #     default: "high" # Default "low", "medium", "high", "max" or numerical value.
-  #   mode: "exclusive" # "exclusive" or "shared". In "exclusive" mode, each worker will be pinned to a CPU.
-  #   # If the number of CPUs is less than number of workers, the pinning will wrap around.
+  #     default: "medium"

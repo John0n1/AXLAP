@@ -4,53 +4,50 @@
 # Installation Script
 
 set -e # Exit immediately if a command exits with a non-zero status.
-# set -x # Debug mode: Print each command before executing
 
 # --- Configuration ---
-AXLAP_BASE_DIR="/opt/axlap"
-AXLAP_REPO_URL="https://github.com/John0n1/axlap.git" 
+AXLAP_BASE_DIR="${AXLAP_INSTALL_DIR:-/opt/axlap}" # Allow overriding base directory
+AXLAP_REPO_URL="https://github.com/John0n1/axlap.git"
 AXLAP_BRANCH="main"
 
-# Network interface for Zeek/Suricata/Arkime to capture from
-# Prompt user or detect, but directive says "no prompt", so use a default or require env var
-CAPTURE_INTERFACE="${AXLAP_CAPTURE_INTERFACE:-eth0}" # Default to eth0, can be overridden by env var
+CAPTURE_INTERFACE="${AXLAP_CAPTURE_INTERFACE:-eth0}"
 
-# Home networks for Suricata and Zeek (CIDR, comma-separated)
-# This should include your local network(s) and the Docker network for AXLAP.
 DEFAULT_LOCAL_NETS="192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-AXLAP_DOCKER_SUBNET="172.28.0.0/16" # From docker-compose.yml
-HOME_NETS="${AXLAP_HOME_NETS:-${DEFAULT_LOCAL_NETS},${AXLAP_DOCKER_SUBNET}}"
+# Try to detect Docker's default bridge network or common virtual machine networks.
+# This is a best-effort and might need manual adjustment.
+DETECTED_DOCKER_NETS=$(ip -o addr show docker0 2>/dev/null | awk '{print $4}' | head -n1)
+HOME_NETS_ARRAY=()
+IFS=',' read -ra DEFAULT_NETS_ARRAY <<< "${DEFAULT_LOCAL_NETS}"
+for net in "${DEFAULT_NETS_ARRAY[@]}"; do HOME_NETS_ARRAY+=("$net"); done
+if [ -n "$DETECTED_DOCKER_NETS" ]; then HOME_NETS_ARRAY+=("$DETECTED_DOCKER_NETS"); fi
+# Add common VirtualBox/VMware NAT networks
+HOME_NETS_ARRAY+=("192.168.56.0/24") # VirtualBox Host-Only
+HOME_NETS_ARRAY+=("172.28.0.0/16")   # Default AXLAP Docker Compose network (from yml)
 
-# OpenCTI Admin Credentials (Generate random if not set via ENV)
+# Join unique networks
+UNIQUE_HOME_NETS=$(echo "${HOME_NETS_ARRAY[@]}" | tr ' ' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
+HOME_NETS="${AXLAP_HOME_NETS:-${UNIQUE_HOME_NETS}}"
+
 OPENCTI_ADMIN_EMAIL="${OPENCTI_ADMIN_EMAIL:-admin@axlap.local}"
-OPENCTI_ADMIN_PASSWORD_DEFAULT="ChangeMeAXLAP!$(openssl rand -hex 8)"
-OPENCTI_ADMIN_PASSWORD="${OPENCTI_ADMIN_PASSWORD:-${OPENCTI_ADMIN_PASSWORD_DEFAULT}}"
-OPENCTI_ADMIN_TOKEN_DEFAULT=$(openssl rand -hex 32)
-OPENCTI_ADMIN_TOKEN="${OPENCTI_ADMIN_TOKEN:-${OPENCTI_ADMIN_TOKEN_DEFAULT}}"
+OPENCTI_ADMIN_PASSWORD="${OPENCTI_ADMIN_PASSWORD:-ChangeMeAXLAP!$(openssl rand -hex 12)}"
+OPENCTI_ADMIN_TOKEN="${OPENCTI_ADMIN_TOKEN:-$(openssl rand -hex 32)}"
 
-# MISP Connector Config (Placeholder values, should be set by user if MISP is used)
-MISP_URL="${MISP_URL:-http://your-misp-instance.local}" # Must be reachable by OpenCTI MISP connector
-MISP_KEY="${MISP_KEY:-YourMispApiKey}"
-CONNECTOR_MISP_ID_DEFAULT=$(uuidgen)
-CONNECTOR_MISP_ID="${CONNECTOR_MISP_ID:-${CONNECTOR_MISP_ID_DEFAULT}}"
+MISP_URL="${MISP_URL:-}" # Leave empty if not used
+MISP_KEY="${MISP_KEY:-}"  # Leave empty if not used
+CONNECTOR_MISP_ID="${CONNECTOR_MISP_ID:-$(uuidgen)}"
 
-# Other OpenCTI Connector IDs
-CONNECTOR_EXPORT_FILE_STIX_ID_DEFAULT=$(uuidgen)
-CONNECTOR_EXPORT_FILE_STIX_ID="${CONNECTOR_EXPORT_FILE_STIX_ID:-${CONNECTOR_EXPORT_FILE_STIX_ID_DEFAULT}}"
-CONNECTOR_IMPORT_FILE_STIX_ID_DEFAULT=$(uuidgen)
-CONNECTOR_IMPORT_FILE_STIX_ID="${CONNECTOR_IMPORT_FILE_STIX_ID:-${CONNECTOR_IMPORT_FILE_STIX_ID_DEFAULT}}"
+CONNECTOR_EXPORT_FILE_STIX_ID="${CONNECTOR_EXPORT_FILE_STIX_ID:-$(uuidgen)}"
+CONNECTOR_IMPORT_FILE_STIX_ID="${CONNECTOR_IMPORT_FILE_STIX_ID:-$(uuidgen)}"
 
-# Arkime passwordSecret
-ARKIME_PASSWORD_SECRET_DEFAULT="AXLAP_Secret_$(openssl rand -hex 16)"
-ARKIME_PASSWORD_SECRET="${ARKIME_PASSWORD_SECRET:-${ARKIME_PASSWORD_SECRET_DEFAULT}}"
+ARKIME_PASSWORD_SECRET="${ARKIME_PASSWORD_SECRET:-AXLAP_Secret_$(openssl rand -hex 24)}"
 
-# MinIO Credentials for OpenCTI S3 storage
-MINIO_ROOT_USER_DEFAULT="axlap_minio_user"
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-${MINIO_ROOT_USER_DEFAULT}}"
-MINIO_ROOT_PASSWORD_DEFAULT="ChangeMeAXLAP!minio_$(openssl rand -hex 8)"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${MINIO_ROOT_PASSWORD_DEFAULT}}"
+MINIO_ROOT_USER="${MINIO_ROOT_USER:-axlap_minio_admin}"
+MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-ChangeMeAXLAP!minio_$(openssl rand -hex 12)}"
 
-LOG_FILE="${AXLAP_BASE_DIR}/logs/install.log"
+LOG_DIR="${AXLAP_BASE_DIR}/logs"
+LOG_FILE="${LOG_DIR}/install.log"
+ENV_FILE="${AXLAP_BASE_DIR}/.env"
+DOCKER_COMPOSE_FILE="${AXLAP_BASE_DIR}/docker-compose.yml"
 
 # --- Helper Functions ---
 log() {
@@ -65,340 +62,295 @@ check_root() {
 }
 
 check_os() {
-    if ! grep -q "Ubuntu" /etc/os-release; then
-        log "WARNING: This script is primarily tested on Ubuntu. Your OS might not be fully compatible."
-        # exit 1 # Potentially allow continuation on Debian-based systems
+    if ! grep -qi "ubuntu" /etc/os-release; then
+        log "WARNING: This script is primarily tested on Ubuntu. Your OS might require manual adjustments."
     fi
     source /etc/os-release
-    if [[ "$VERSION_ID" < "20.04" ]]; then
-        log "WARNING: Ubuntu 20.04 or newer is recommended. Your version: $VERSION_ID"
+    if [[ "$(echo \"$VERSION_ID\" | cut -d. -f1)" -lt "20" ]]; then
+        log "WARNING: Ubuntu 20.04 or newer is strongly recommended. Your version: $VERSION_ID"
     fi
 }
 
 check_command() {
     if ! command -v "$1" &> /dev/null; then
-        log "ERROR: Command '$1' not found. Please install it."
+        log "ERROR: Command '$1' not found. Please install it and try again."
         exit 1
     fi
 }
 
-# --- Main Installation Steps ---
-
-main() {
-    check_root
-    check_os
-
-    # Create base directory and log file
-    mkdir -p "${AXLAP_BASE_DIR}/logs"
-    touch "${LOG_FILE}"
-    chmod 600 "${LOG_FILE}"
-    log "AXLAP installation started."
-
-    # 1. Install System Dependencies
-    log "Installing system dependencies..."
-    apt-get update -y >> "${LOG_FILE}" 2>&1
-    apt-get install -y --no-install-recommends \
-        git \
-        curl \
-        docker.io \
-        docker-compose \
-        python3 \
-        python3-pip \
-        python3-venv \
-        python3-dev \
-        libncurses-dev \
-        make \
-        iptables \
-        apparmor-utils \
-        uuid-runtime \
-        openssl \
-        jq \
-        apt-transport-https \
-        ca-certificates \
-        gnupg \
-        lsb-release \
-        libpcap-dev \
-        libcurl4-openssl-dev \
-        rsync \
-        yq \
-        net-tools \
-        htop \
-        >> "${LOG_FILE}" 2>&1
-
-    # Check if Docker daemon is running
-    if ! systemctl is-active --quiet docker; then
-        log "Starting Docker service..."
-        systemctl start docker >> "${LOG_FILE}" 2>&1
-        systemctl enable docker >> "${LOG_FILE}" 2>&1
-    fi
-    log "Docker and Docker Compose versions:"
-    docker --version | tee -a "${LOG_FILE}"
-    docker-compose --version | tee -a "${LOG_FILE}"
-
-
-    # 2. Setup AXLAP Directory Structure and Clone/Copy Repo
-    if [ -d "${AXLAP_BASE_DIR}/.git" ]; then
-        log "AXLAP directory already exists and seems to be a git repo. Pulling latest changes..."
-        cd "${AXLAP_BASE_DIR}"
-        # git checkout "${AXLAP_BRANCH}" >> "${LOG_FILE}" 2>&1
-        # git pull origin "${AXLAP_BRANCH}" >> "${LOG_FILE}" 2>&1
-        # For now, assume script is run from within the cloned repo directory
-        log "Assuming install script is run from the root of the AXLAP git repository."
-        # Copy current directory content (the repo) to AXLAP_BASE_DIR
-        # This handles the case where user clones repo and then runs install.sh from within it.
-        # If install.sh is outside, it should clone. For this, assume it's inside.
-        if [ "$(pwd)" != "${AXLAP_BASE_DIR}" ]; then
-            log "Copying AXLAP project files to ${AXLAP_BASE_DIR}..."
-            mkdir -p "${AXLAP_BASE_DIR}"
-            # Use rsync or cp, ensuring .git is copied if it's a clone, or not if it's just files
-            # Example: rsync -a --exclude '.git' "$(pwd)/" "${AXLAP_BASE_DIR}/" >> "${LOG_FILE}" 2>&1
-            # Simpler: Assume user has cloned to AXLAP_BASE_DIR or this script is inside it.
-            # For robustness, let's copy from current PWD if not already in AXLAP_BASE_DIR
-            # For now, let's cd to where the script is and work relative to that.
-            SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-            if [ "${SCRIPT_DIR}" != "${AXLAP_BASE_DIR}" ]; then
-                log "Copying AXLAP source from ${SCRIPT_DIR} to ${AXLAP_BASE_DIR}"
-                mkdir -p "${AXLAP_BASE_DIR}"
-                # Using cp for simplicity. rsync is better for updates.
-                cp -R "${SCRIPT_DIR}/." "${AXLAP_BASE_DIR}/"
-            fi
-        fi
-    else
-        log "AXLAP directory ${AXLAP_BASE_DIR} does not appear to be a git repo. Assuming script is run from a fresh copy."
-        # If not a git repo, means script is part of a copied dir.
-        # Ensure current dir is where axlap files are.
-        SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-        if [ "${SCRIPT_DIR}" != "${AXLAP_BASE_DIR}" ]; then
-            log "Copying AXLAP source from ${SCRIPT_DIR} to ${AXLAP_BASE_DIR}"
-            mkdir -p "${AXLAP_BASE_DIR}"
-            cp -R "${SCRIPT_DIR}/." "${AXLAP_BASE_DIR}/"
-        fi
-    fi
-    cd "${AXLAP_BASE_DIR}"
-
-    log "Creating AXLAP data and configuration directories..."
+create_directories() {
+    log "Creating AXLAP directories under ${AXLAP_BASE_DIR}..."
+    mkdir -p "${LOG_DIR}"
     mkdir -p "${AXLAP_BASE_DIR}/data/elasticsearch_data"
     mkdir -p "${AXLAP_BASE_DIR}/data/arkime_pcap"
-    mkdir -p "${AXLAP_BASE_DIR}/data/arkime_es_data" # Arkime might use its own ES index in main ES
-    mkdir -p "${AXLAP_BASE_DIR}/data/opencti_data/postgres"
+    # Arkime data is within the main Elasticsearch instance in this setup.
     mkdir -p "${AXLAP_BASE_DIR}/data/opencti_data/s3"
     mkdir -p "${AXLAP_BASE_DIR}/data/opencti_data/redis"
-    mkdir -p "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" # For OpenCTI's dedicated ES
+    mkdir -p "${AXLAP_BASE_DIR}/data/opencti_data/es_octi"
     mkdir -p "${AXLAP_BASE_DIR}/data/zeek_logs_raw"
     mkdir -p "${AXLAP_BASE_DIR}/data/suricata_logs"
-    mkdir -p "${AXLAP_BASE_DIR}/data/ml_models_data"
-    mkdir -p "${AXLAP_BASE_DIR}/logs" # General logs
-    mkdir -p "${AXLAP_BASE_DIR}/rules" # Suricata local rules
-    mkdir -p "${AXLAP_BASE_DIR}/config/zeek/site" # For Zeek site policies
-    mkdir -p "${AXLAP_BASE_DIR}/config/zeek/plugin_configs" # For Zeek plugin YAML configs
+    mkdir -p "${AXLAP_BASE_DIR}/data/ml_models_data" # For ML models and scalers
+    mkdir -p "${AXLAP_BASE_DIR}/rules/suricata_custom" # For custom Suricata rules
+    mkdir -p "${AXLAP_BASE_DIR}/config/zeek/site"
+    mkdir -p "${AXLAP_BASE_DIR}/config/zeek/intel" # For Zeek threat intel files
+    mkdir -p "${AXLAP_BASE_DIR}/config/zeek/plugin_configs"
+    mkdir -p "${AXLAP_BASE_DIR}/scripts" # Ensure scripts dir exists for axlap_common_env.sh
+    mkdir -p "${AXLAP_BASE_DIR}/venv"   # For Python virtual environment
 
-    # Set permissions (example: ensure Docker containers can write if needed, though volumes handle this)
-    # chmod -R 777 "${AXLAP_BASE_DIR}/data" # Overly permissive, Docker volumes handle user mapping
-    # Elasticsearch needs specific user for its data dir (usually uid 1000). Docker handles this.
+    # Set permissions for Elasticsearch data directory if it's newly created
+    # Elasticsearch container runs as user elasticsearch (uid 1000)
+    # This is often handled by Docker volume mounts, but explicit chown can prevent issues.
+    if [ -d "${AXLAP_BASE_DIR}/data/elasticsearch_data" ]; then
+        chown -R 1000:1000 "${AXLAP_BASE_DIR}/data/elasticsearch_data" || log "Warning: Could not chown elasticsearch_data. Check permissions."
+    fi
+    if [ -d "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" ]; then
+        chown -R 1000:1000 "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" || log "Warning: Could not chown opencti_data/es_octi. Check permissions."
+    fi
+}
 
-    # 3. Configure Services (Update config files with dynamic values)
-    log "Configuring AXLAP services..."
+setup_axlap_source() {
+    log "Setting up AXLAP source files in ${AXLAP_BASE_DIR}..."
+    # Determine if the script is running from within a git clone or a standalone copy
+    SCRIPT_REAL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-    # Update docker-compose.yml with generated tokens/passwords
-    log "Updating docker-compose.yml with secrets..."
-    DOCKER_COMPOSE_FILE="${AXLAP_BASE_DIR}/docker-compose.yml"
-    sed -i "s|\${OPENCTI_ADMIN_EMAIL:-admin@axlap.local}|${OPENCTI_ADMIN_EMAIL}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${OPENCTI_ADMIN_PASSWORD:-ChangeMeAXLAP!123}|${OPENCTI_ADMIN_PASSWORD}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${OPENCTI_ADMIN_TOKEN:-GenerateRandomOrFixed}|${OPENCTI_ADMIN_TOKEN}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${MINIO_ROOT_USER:-axlap_minio_user}|${MINIO_ROOT_USER}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${MINIO_ROOT_PASSWORD:-ChangeMeAXLAP!minio}|${MINIO_ROOT_PASSWORD}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${CONNECTOR_EXPORT_FILE_STIX_ID:-GenerateRandomUUID}|${CONNECTOR_EXPORT_FILE_STIX_ID}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${CONNECTOR_IMPORT_FILE_STIX_ID:-GenerateRandomUUID}|${CONNECTOR_IMPORT_FILE_STIX_ID}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${CONNECTOR_MISP_ID}|${CONNECTOR_MISP_ID}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${MISP_URL:-http://localhost:8888}|${MISP_URL}|g" "${DOCKER_COMPOSE_FILE}"
-    sed -i "s|\${MISP_KEY:-YourMispApiKey}|${MISP_KEY}|g" "${DOCKER_COMPOSE_FILE}"
+    if [ -d "${SCRIPT_REAL_DIR}/.git" ] && [ "${SCRIPT_REAL_DIR}" != "${AXLAP_BASE_DIR}" ]; then
+        log "Copying AXLAP git repository from ${SCRIPT_REAL_DIR} to ${AXLAP_BASE_DIR}..."
+        # Use rsync to copy, excluding .git if not desired, or include if it's the primary copy
+        rsync -av --exclude='.git/' --exclude='data/' --exclude='logs/' --exclude='venv/' "${SCRIPT_REAL_DIR}/" "${AXLAP_BASE_DIR}/" >> "${LOG_FILE}" 2>&1
+    elif [ ! -d "${AXLAP_BASE_DIR}/docker-compose.yml" ]; then # If target doesn't look like AXLAP
+        if [ -d "${SCRIPT_REAL_DIR}/docker-compose.yml" ]; then # And current script dir does
+             log "Copying AXLAP files from ${SCRIPT_REAL_DIR} to ${AXLAP_BASE_DIR}..."
+             rsync -av --exclude='data/' --exclude='logs/' --exclude='venv/' "${SCRIPT_REAL_DIR}/" "${AXLAP_BASE_DIR}/" >> "${LOG_FILE}" 2>&1
+        else
+            log "Cloning AXLAP repository from ${AXLAP_REPO_URL} (branch: ${AXLAP_BRANCH})..."
+            git clone --branch "${AXLAP_BRANCH}" "${AXLAP_REPO_URL}" "${AXLAP_BASE_DIR}" >> "${LOG_FILE}" 2>&1
+        fi
+    else
+        log "AXLAP files seem to be already in place at ${AXLAP_BASE_DIR}."
+    fi
+    cd "${AXLAP_BASE_DIR}"
+}
 
-    # Update Arkime config.ini
-    log "Updating Arkime config.ini..."
-    ARKIME_CONFIG_FILE="${AXLAP_BASE_DIR}/config/arkime/config.ini"
-    sed -i "s|passwordSecret = .*|passwordSecret = \"${ARKIME_PASSWORD_SECRET}\"|" "${ARKIME_CONFIG_FILE}"
-    sed -i "s|interface = .*|interface = ${CAPTURE_INTERFACE}|" "${ARKIME_CONFIG_FILE}" # For Arkime capture if it does live capture
-    # Ensure elasticsearch host is correct (axlap-elasticsearch:9200)
-    sed -i "s|elasticsearch=.*|elasticsearch=http://axlap-elasticsearch:9200|" "${ARKIME_CONFIG_FILE}"
-
-
-    # Update Zeek node.cfg and local.zeek (if needed for interface)
-    # Zeek Dockerfile entrypoint handles ZEEK_INTERFACE env var for node.cfg
-    # Zeek networks.cfg should be populated with HOME_NETS
-    log "Updating Zeek networks.cfg..."
-    ZEEK_NETWORKS_CFG="${AXLAP_BASE_DIR}/config/zeek/networks.cfg"
-    echo "# Auto-generated by AXLAP install.sh" > "${ZEEK_NETWORKS_CFG}"
-    IFS=',' read -ra ADDR <<< "$HOME_NETS"
-    for net in "${ADDR[@]}"; do
-        echo "$net" >> "${ZEEK_NETWORKS_CFG}"
-    done
-    # Copy local.zeek to site dir for Zeek to load
-    cp "${AXLAP_BASE_DIR}/config/zeek/local.zeek" "${AXLAP_BASE_DIR}/config/zeek/site/local.zeek"
-
-    # Update Suricata suricata.yaml (HOME_NET, interface)
-    # Suricata Dockerfile entrypoint handles SURICATA_INTERFACE and HOME_NET_CONFIG env vars.
-    # We need to pass these to docker-compose.yml or set them in the entrypoint.
-    # The docker-compose.yml already defines env vars for these for Suricata.
-    # Update the default values in docker-compose.yml for suricata if needed, or rely on entrypoint.
-    # For now, let entrypoint in Suricata Dockerfile handle it. The values for HOME_NET_CONFIG
-    # and SURICATA_INTERFACE are passed through docker-compose.yml using .env file or direct values.
+configure_env_file() {
+    log "Creating and populating .env file: ${ENV_FILE}"
     # Create .env file for docker-compose
-    ENV_FILE="${AXLAP_BASE_DIR}/.env"
-    log "Creating .env file for docker-compose..."
-    echo "# Auto-generated by AXLAP install.sh" > "${ENV_FILE}"
+    # Ensure this file has restricted permissions
+    rm -f "${ENV_FILE}"
+    touch "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
+
+    echo "# AXLAP Environment Configuration - Auto-generated by install.sh" > "${ENV_FILE}"
     echo "AXLAP_BASE_DIR=${AXLAP_BASE_DIR}" >> "${ENV_FILE}"
-    echo "CAPTURE_INTERFACE=${CAPTURE_INTERFACE}" >> "${ENV_FILE}"
-    echo "HOME_NETS_CONFIG_SURICATA=\"[${HOME_NETS}]\"" >> "${ENV_FILE}" # Suricata needs specific format
-    # These are already handled by sed replacement in docker-compose.yml directly
-    # echo "OPENCTI_ADMIN_EMAIL=${OPENCTI_ADMIN_EMAIL}" >> "${ENV_FILE}"
-    # echo "OPENCTI_ADMIN_PASSWORD=${OPENCTI_ADMIN_PASSWORD}" >> "${ENV_FILE}"
-    # echo "OPENCTI_ADMIN_TOKEN=${OPENCTI_ADMIN_TOKEN}" >> "${ENV_FILE}"
-    # ... and so on for other secrets.
+    echo "COMPOSE_PROJECT_NAME=axlap" >> "${ENV_FILE}" # Sets a project name for Docker Compose
 
-    # Update AXLAP TUI config
-    log "Updating AXLAP TUI config..."
+    # Network configurations
+    echo "CAPTURE_INTERFACE_FROM_ENV=${CAPTURE_INTERFACE}" >> "${ENV_FILE}" # For Arkime capture, Suricata, Zeek
+    echo "HOME_NETS_FROM_ENV=${HOME_NETS}" >> "${ENV_FILE}" # For Zeek networks.cfg
+    # Suricata's HOME_NET needs to be in the format "[cidr1,cidr2]"
+    SURICATA_HOME_NET_FORMATTED="[$(echo "${HOME_NETS}" | sed 's/,/, /g')]"
+    echo "HOME_NETS_CONFIG_SURICATA=${SURICATA_HOME_NET_FORMATTED}" >> "${ENV_FILE}"
+
+    # Secrets and Tokens
+    echo "OPENCTI_ADMIN_EMAIL=${OPENCTI_ADMIN_EMAIL}" >> "${ENV_FILE}"
+    echo "OPENCTI_ADMIN_PASSWORD=${OPENCTI_ADMIN_PASSWORD}" >> "${ENV_FILE}"
+    echo "OPENCTI_ADMIN_TOKEN=${OPENCTI_ADMIN_TOKEN}" >> "${ENV_FILE}"
+
+    echo "MINIO_ROOT_USER=${MINIO_ROOT_USER}" >> "${ENV_FILE}"
+    echo "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" >> "${ENV_FILE}"
+
+    echo "ARKIME_PASSWORD_SECRET=${ARKIME_PASSWORD_SECRET}" >> "${ENV_FILE}"
+    # ARKIME_ELASTICSEARCH is set directly in docker-compose.yml for arkime-viewer/capture
+
+    # Connector specific (ensure these are used in docker-compose.yml for connectors)
+    echo "CONNECTOR_EXPORT_FILE_STIX_ID=${CONNECTOR_EXPORT_FILE_STIX_ID}" >> "${ENV_FILE}"
+    echo "CONNECTOR_IMPORT_FILE_STIX_ID=${CONNECTOR_IMPORT_FILE_STIX_ID}" >> "${ENV_FILE}"
+    echo "CONNECTOR_MISP_ID=${CONNECTOR_MISP_ID}" >> "${ENV_FILE}"
+    if [ -n "${MISP_URL}" ] && [ -n "${MISP_KEY}" ]; then
+        echo "MISP_URL=${MISP_URL}" >> "${ENV_FILE}"
+        echo "MISP_KEY=${MISP_KEY}" >> "${ENV_FILE}"
+    else
+        log "MISP_URL or MISP_KEY not set. MISP connector will require manual configuration if used."
+        echo "# MISP_URL=" >> "${ENV_FILE}"
+        echo "# MISP_KEY=" >> "${ENV_FILE}"
+    fi
+
+    # Zeek related env vars for Dockerfile or runtime
+    echo "ZEEK_INTERFACE_FROM_ENV=${CAPTURE_INTERFACE}" >> "${ENV_FILE}"
+    # LOCAL_NETS_FROM_ENV is used by Zeek Dockerfile entrypoint to update local.zeek or networks.cfg
+    echo "LOCAL_NETS_FROM_ENV=${HOME_NETS}" >> "${ENV_FILE}"
+
+    # Suricata related env vars for Dockerfile or runtime
+    echo "SURICATA_INTERFACE_FROM_ENV=${CAPTURE_INTERFACE}" >> "${ENV_FILE}"
+    # HOME_NETS_CONFIG_SURICATA is already set above for Suricata entrypoint
+
+    log ".env file created successfully."
+}
+
+update_configs() {
+    log "Updating service configuration files..."
+
+    # Arkime config.ini
+    # passwordSecret and elasticsearch URL are now primarily driven by .env through docker-compose for Arkime service
+    # The interface for live capture is also passed via .env to CAPTURE_INTERFACE_FROM_ENV
+    # So, config.ini should use these env vars: ${ARKIME_PASSWORD_SECRET}, ${ARKIME_ELASTICSEARCH}, ${CAPTURE_INTERFACE_FROM_ENV}
+    # Ensure config.ini template in the repo uses these placeholders.
+    # Example: sed -i "s|^elasticsearch=.*|elasticsearch=\${ARKIME_ELASTICSEARCH:-http://axlap-elasticsearch:9200}|" "${AXLAP_BASE_DIR}/config/arkime/config.ini"
+    # This is better handled if config.ini is templated to use env vars directly. Assuming it is.
+
+    # Zeek networks.cfg
+    # This is populated by the Zeek container's entrypoint script using ZEEK_HOME_NETS_FROM_ENV or similar.
+    # Or, we can write it directly here.
+    ZEEK_NETWORKS_CFG="${AXLAP_BASE_DIR}/config/zeek/networks.cfg"
+    log "Configuring Zeek networks.cfg: ${ZEEK_NETWORKS_CFG}"
+    echo "# AXLAP Zeek Local Networks - Auto-generated by install.sh" > "${ZEEK_NETWORKS_CFG}"
+    echo "# Used by Zeek to distinguish local traffic from remote." >> "${ZEEK_NETWORKS_CFG}"
+    echo "\${HOME_NETS_FROM_ENV}" >> "${ZEEK_NETWORKS_CFG}" # Placeholder to be resolved by Zeek entrypoint or this script
+    # Let's resolve it here directly from $HOME_NETS
+    echo "" > "${ZEEK_NETWORKS_CFG}" # Clear it first
+    IFS=',' read -ra ADDR <<< "$HOME_NETS"
+    for net_cidr in "${ADDR[@]}"; do
+        echo "${net_cidr}" >> "${ZEEK_NETWORKS_CFG}"
+    done
+    log "Zeek networks.cfg configured with: ${HOME_NETS}"
+
+    # Zeek local.zeek - ensure it loads custom plugins and sets logdir
+    # The path /opt/axlap/zeek_plugins is hardcoded in local.zeek, ensure it matches.
+    # Log::logdir = "/var/log/zeek_json" is also in local.zeek.
+    # Copy the template local.zeek to the site directory if not already there.
+    if [ -f "${AXLAP_BASE_DIR}/config/zeek/local.zeek" ] && [ ! -f "${AXLAP_BASE_DIR}/config/zeek/site/local.zeek" ]; then
+        cp "${AXLAP_BASE_DIR}/config/zeek/local.zeek" "${AXLAP_BASE_DIR}/config/zeek/site/local.zeek"
+        log "Copied local.zeek to site configuration."
+    fi
+    # Update Zeek node.cfg interface placeholder (though entrypoint should handle it too)
+    sed -i "s|^\s*interface=.*|interface=\${ZEEK_INTERFACE_FROM_ENV:-eth0}|" "${AXLAP_BASE_DIR}/config/zeek/node.cfg"
+
+
+    # Suricata suricata.yaml - HOME_NET and interface are handled by its entrypoint script via ENV vars from .env
+    # Ensure suricata.yaml uses placeholders like ${HOME_NETS_CONFIG_SURICATA} and ${SURICATA_INTERFACE_FROM_ENV}
+    # The provided suricata.yaml seems to use these.
+
+    # AXLAP TUI config
     TUI_CONFIG_FILE="${AXLAP_BASE_DIR}/config/axlap_tui_config.ini"
-    sed -i "s|\${OPENCTI_ADMIN_TOKEN_FROM_ENV}|${OPENCTI_ADMIN_TOKEN}|" "${TUI_CONFIG_FILE}"
-    # Update paths if needed, assuming TUI runs from AXLAP_BASE_DIR
-    sed -i "s|train_script_path = .*|train_script_path = ${AXLAP_BASE_DIR}/scripts/train_ml_model.sh|" "${TUI_CONFIG_FILE}"
-    sed -i "s|update_script_path = .*|update_script_path = ${AXLAP_BASE_DIR}/scripts/update_rules_and_feeds.sh|" "${TUI_CONFIG_FILE}"
-    sed -i "s|zeek_plugins_dir = .*|zeek_plugins_dir = ${AXLAP_BASE_DIR}/src/zeek_plugins/|" "${TUI_CONFIG_FILE}"
-    sed -i "s|zeek_plugin_config_dir = .*|zeek_plugin_config_dir = ${AXLAP_BASE_DIR}/config/zeek/plugin_configs/|" "${TUI_CONFIG_FILE}"
-    sed -i "s|zeek_local_script = .*|zeek_local_script = ${AXLAP_BASE_DIR}/config/zeek/site/local.zeek|" "${TUI_CONFIG_FILE}"
+    log "Updating AXLAP TUI config: ${TUI_CONFIG_FILE}"
+    # Replace placeholder for OpenCTI API Key
+    sed -i "s|api_key = .*|api_key = \${OPENCTI_ADMIN_TOKEN_FROM_ENV}|" "${TUI_CONFIG_FILE}"
+    # Ensure paths in TUI config are relative to AXLAP_BASE_DIR or absolute using it
+    # These paths are for the TUI running on the host, accessing scripts/plugins within AXLAP_BASE_DIR
+    sed -i "s|^train_script_path = .*|train_script_path = ${AXLAP_BASE_DIR}/scripts/train_ml_model.sh|" "${TUI_CONFIG_FILE}"
+    sed -i "s|^update_script_path = .*|update_script_path = ${AXLAP_BASE_DIR}/scripts/update_rules_and_feeds.sh|" "${TUI_CONFIG_FILE}"
+    sed -i "s|^zeek_plugins_dir = .*|zeek_plugins_dir = ${AXLAP_BASE_DIR}/src/zeek_plugins/|" "${TUI_CONFIG_FILE}"
+    sed -i "s|^zeek_plugin_config_dir = .*|zeek_plugin_config_dir = ${AXLAP_BASE_DIR}/config/zeek/plugin_configs/|" "${TUI_CONFIG_FILE}"
+    sed -i "s|^zeek_local_script = .*|zeek_local_script = ${AXLAP_BASE_DIR}/config/zeek/site/local.zeek|" "${TUI_CONFIG_FILE}"
+    # Ensure Elasticsearch host/port for TUI is 127.0.0.1:9200 as per docker-compose port mapping
+    sed -i "/^\[elasticsearch\]/,/^\[/ s|^host = .*|host = 127.0.0.1|" "${TUI_CONFIG_FILE}"
+    sed -i "/^\[elasticsearch\]/,/^\[/ s|^port = .*|port = 9200|" "${TUI_CONFIG_FILE}"
+    # Ensure Arkime host/port for TUI is 127.0.0.1:8005
+    sed -i "/^\[arkime\]/,/^\[/ s|^host = .*|host = 127.0.0.1|" "${TUI_CONFIG_FILE}"
+    sed -i "/^\[arkime\]/,/^\[/ s|^port = .*|port = 8005|" "${TUI_CONFIG_FILE}"
+    # Ensure OpenCTI URL for TUI is 127.0.0.1:8080
+    sed -i "/^\[opencti\]/,/^\[/ s|^url = .*|url = http://127.0.0.1:8080|" "${TUI_CONFIG_FILE}"
 
-    # Set executable permissions for scripts
-    log "Setting executable permissions for scripts..."
-    find "${AXLAP_BASE_DIR}/scripts" -name "*.sh" -exec chmod +x {} \;
-    chmod +x "${AXLAP_BASE_DIR}/src/tui/axlap_tui.py"
+    log "Service configurations updated."
+}
 
-    # 4. Build Custom Docker Images
-    log "Building custom Docker images (Zeek, Suricata, ML Engine, Arkime)..."
-    # Pass build ARGs for interfaces to Dockerfiles if needed
-    # Example: docker-compose build --build-arg ZEEK_INTERFACE=${CAPTURE_INTERFACE} zeek
-    # This is now handled by runtime ENV vars in containers.
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" build >> "${LOG_FILE}" 2>&1
-
-    # 5. Pull Official Docker Images (Elasticsearch, OpenCTI, etc.)
-    log "Pulling official Docker images..."
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" pull >> "${LOG_FILE}" 2>&1 # Pulls images not built locally
-
-    # 6. Initial Rule/Feed Updates (Suricata)
-    log "Performing initial Suricata rules update (via container entrypoint on first run)..."
-    # This is handled by Suricata container's entrypoint.sh on first start.
-    # Can also run it preemptively:
-    # docker-compose -f "${DOCKER_COMPOSE_FILE}" run --rm suricata /usr/local/bin/entrypoint.sh # This might not work as expected due to how run works
-    # The entrypoint of the Suricata container will handle this when it starts.
-
-    # 7. Start All Services with Docker Compose
-    log "Starting AXLAP services using Docker Compose..."
-    # Use axlap_common_env.sh to pass environment variables to docker-compose
-    # source "${AXLAP_BASE_DIR}/scripts/axlap_common_env.sh" # Loads vars into current shell
-    # The .env file created earlier should be picked up automatically by docker-compose.
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d >> "${LOG_FILE}" 2>&1
-
-    log "Waiting for services to initialize (Elasticsearch, OpenCTI)... This may take several minutes."
-    # Wait for Elasticsearch
+wait_for_elasticsearch() {
+    local es_host_port="$1"
+    local service_name="$2"
+    log "Waiting for ${service_name} Elasticsearch (${es_host_port}) to be healthy..."
     MAX_WAIT=300 # 5 minutes
     COUNT=0
-    log "Waiting for Main Elasticsearch (axlap-elasticsearch) to be healthy..."
-    while ! curl -s "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s" > /dev/null; do
+    while ! curl -s -k "http://${es_host_port}/_cluster/health?wait_for_status=yellow&timeout=10s" > /dev/null 2>&1; do
         sleep 10
         COUNT=$((COUNT + 10))
         if [ "$COUNT" -ge "$MAX_WAIT" ]; then
-            log "ERROR: Main Elasticsearch (axlap-elasticsearch) did not become healthy in time."
-            # docker-compose logs elasticsearch # for debugging
-            # exit 1 # Don't exit, some things might still work or user can debug
-            break
+            log "ERROR: ${service_name} Elasticsearch (${es_host_port}) did not become healthy in time."
+            log "Run 'docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs ${service_name}' for details."
+            return 1 # Failure
         fi
         printf "."
     done
-    log "Main Elasticsearch is up."
+    echo # Newline after dots
+    log "${service_name} Elasticsearch (${es_host_port}) is up and healthy."
+    return 0 # Success
+}
 
-    # Wait for OpenCTI Elasticsearch
-    log "Waiting for OpenCTI Elasticsearch (axlap-opencti-es) to be healthy..."
-    # Assuming OpenCTI ES is similar and will eventually be up.
-    # Docker compose healthcheck for opencti-elasticsearch will manage its readiness for opencti container.
-    # We don't have a direct port mapping for opencti-es by default to check from host.
-    # Rely on docker-compose 'depends_on' health checks.
-
-    # 8. Initialize Arkime Database
+initialize_arkime() {
     log "Initializing Arkime database in Elasticsearch..."
-    # Arkime needs its Elasticsearch indices created.
-    # The configure_arkime.sh script will handle this.
-    # Wait a bit for Arkime viewer to be ready to accept commands or for ES to be fully ready.
-    sleep 20
-    # The db.pl script runs inside the viewer container.
-    # We need to run it after ES is up.
-    # docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T arkime-viewer /opt/arkime/db/db.pl http://axlap-elasticsearch:9200 initnoprompt >> "${LOG_FILE}" 2>&1
-    # The "initnoprompt" option is deprecated. "init" is interactive by default.
-    # Arkime's official Docker image might auto-initialize. If not, this is how:
-    # As of Arkime 3.x, you might need to use init instead of initnoprompt, requires interaction or expect script
-    # For non-interactive: echo "INIT" | docker-compose exec -T arkime-viewer /opt/arkime/db/db.pl http://axlap-elasticsearch:9200 init
-    # A safer way is to have a script that polls until it's done.
-    # For now, assume the user might need to run this manually if it fails or use a helper script.
-    # A simple init command (often works for non-interactive):
-    log "Attempting to initialize Arkime database..."
-    if docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T arkime-viewer test -f /opt/arkime/db/db.pl; then
-        echo "INIT" | docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T arkime-viewer /opt/arkime/db/db.pl http://axlap-elasticsearch:9200 init >> "${LOG_FILE}" 2>&1
-        log "Arkime database initialization command sent."
-        # Add an admin user for Arkime
+    # Wait a bit for Arkime viewer to be fully ready after ES is up.
+    sleep 15
+
+    # Check if db.pl exists and then run init
+    if docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T axlap-arkime-viewer test -f /opt/arkime/db/db.pl; then
+        # Attempt non-interactive init. Arkime versions vary in how this works.
+        # Sending "INIT" on stdin is a common method.
+        log "Attempting to initialize Arkime database (sending INIT)..."
+        if echo "INIT" | docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T axlap-arkime-viewer /opt/arkime/db/db.pl http://axlap-elasticsearch:9200 init >> "${LOG_FILE}" 2>&1; then
+            log "Arkime database initialization command completed."
+        else
+            log "WARNING: Arkime database initialization command failed or had non-zero exit. Check logs."
+        fi
+
         log "Adding Arkime admin user (admin / AdminAXLAPPassw0rd)..."
-        docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T arkime-viewer /opt/arkime/bin/arkime_add_user.sh admin "AXLAP Admin" "AdminAXLAPPassw0rd" --admin >> "${LOG_FILE}" 2>&1
-        log "Arkime admin user added. IMPORTANT: Change this password via Arkime UI (http://127.0.0.1:8005)"
+        if docker-compose -f "${DOCKER_COMPOSE_FILE}" exec -T axlap-arkime-viewer /opt/arkime/bin/arkime_add_user.sh admin "AXLAP Admin" "AdminAXLAPPassw0rd" --admin >> "${LOG_FILE}" 2>&1; then
+            log "Arkime admin user 'admin' added with default password."
+            log "IMPORTANT: Change this password via Arkime UI (http://127.0.0.1:8005) after first login."
+        else
+            log "ERROR: Failed to add Arkime admin user. Check logs."
+        fi
     else
         log "WARNING: Arkime db.pl not found in viewer container. Skipping automatic DB init. Arkime might auto-init or require manual setup."
     fi
+}
 
-
-    # 9. Configure OpenCTI (admin user is set via ENV vars in docker-compose)
-    log "OpenCTI should be initializing with admin user: ${OPENCTI_ADMIN_EMAIL}."
-    log "OpenCTI access: http://127.0.0.1:8080. Token for API: ${OPENCTI_ADMIN_TOKEN}"
-    log "Waiting for OpenCTI platform to be available..."
-    COUNT=0
+wait_for_opencti() {
+    log "Waiting for OpenCTI platform (http://127.0.0.1:8080) to be available..."
     MAX_WAIT_OPENCTI=600 # 10 minutes, OpenCTI can take a while
-    while ! curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/graphql -H "Content-Type: application/json" --data-binary '{"query":"{ about { version } }"}' | grep -q "200"; do
+    COUNT=0
+    # Check for a 200 OK on the /graphql endpoint with a basic query
+    while ! curl -s -k -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/graphql -H "Content-Type: application/json" --data-binary '{"query":"{ about { version } }"}' | grep -q "200"; do
         sleep 15
         COUNT=$((COUNT + 15))
         if [ "$COUNT" -ge "$MAX_WAIT_OPENCTI" ]; then
-            log "ERROR: OpenCTI platform did not become available in time."
-            # docker-compose logs opencti # for debugging
-            break # Don't exit, allow user to debug
+            log "ERROR: OpenCTI platform (http://127.0.0.1:8080) did not become available in time."
+            log "Run 'docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs opencti opencti-worker opencti-elasticsearch' for details."
+            return 1
         fi
         printf "o"
     done
+    echo # Newline
     log "OpenCTI platform appears to be up."
+    log "Admin user: ${OPENCTI_ADMIN_EMAIL}, Password: ${OPENCTI_ADMIN_PASSWORD}"
+    log "API Token: ${OPENCTI_ADMIN_TOKEN}"
+    log "IMPORTANT: Change default OpenCTI admin password after first login."
+    return 0
+}
 
-
-    # 10. Setup Python Virtual Environment for TUI and ML Engine (if TUI runs on host)
+setup_python_venv() {
     log "Setting up Python virtual environment for TUI and ML tools..."
-    if [ ! -d "${AXLAP_BASE_DIR}/venv" ]; then
+    if [ ! -f "${AXLAP_BASE_DIR}/venv/bin/activate" ]; then
+        log "Creating Python virtual environment at ${AXLAP_BASE_DIR}/venv..."
         python3 -m venv "${AXLAP_BASE_DIR}/venv" >> "${LOG_FILE}" 2>&1
+    else
+        log "Python virtual environment already exists."
     fi
+
     # shellcheck source=/dev/null
     source "${AXLAP_BASE_DIR}/venv/bin/activate"
+    log "Upgrading pip..."
     pip install --upgrade pip >> "${LOG_FILE}" 2>&1
-    pip install -r "${AXLAP_BASE_DIR}/src/tui/requirements.txt" >> "${LOG_FILE}" 2>&1 # Assuming TUI has its own reqs
+    log "Installing TUI requirements from src/tui/requirements.txt..."
+    pip install elasticsearch >> "${LOG_FILE}" 2>&1
+    log installed "elasticsearch" package for Python
+    pip install -r "${AXLAP_BASE_DIR}/src/tui/requirements.txt" >> "${LOG_FILE}" 2>&1
+    log "Installing ML Engine requirements from src/ml_engine/requirements.txt..."
     pip install -r "${AXLAP_BASE_DIR}/src/ml_engine/requirements.txt" >> "${LOG_FILE}" 2>&1
     deactivate
+    log "Python virtual environment setup complete."
+}
 
-    # 11. Initial ML Model Training (Optional - can be triggered by user later)
-    # log "Skipping initial ML model training. Can be run later using: ${AXLAP_BASE_DIR}/scripts/train_ml_model.sh"
-    # For now, let's try to run it with dummy data or if some logs are already generated.
-    # Check if Elasticsearch has any Zeek data yet.
-    # if curl -s "http://127.0.0.1:9200/axlap-zeek-*/_count" | jq -e '.count > 0'; then
-    #    log "Initial data found. Attempting to train ML model..."
-    #    # Ensure ML engine container can connect to ES_HOST=axlap-elasticsearch
-    #    # This script would run: docker-compose run --rm ml_engine python /app/ml_engine/train.py
-    #    # "${AXLAP_BASE_DIR}/scripts/train_ml_model.sh" >> "${LOG_FILE}" 2>&1
-    # else
-    #    log "No Zeek data yet in Elasticsearch. Skipping initial ML model training."
-    # fi
-    log "ML Model training can be initiated via TUI or by running: sudo ${AXLAP_BASE_DIR}/scripts/train_ml_model.sh"
+setup_systemd_services() {
+    log "Setting up systemd services for AXLAP..."
 
-
-    # 12. Setup Systemd Services for AXLAP and Auto-updates
-    log "Setting up systemd services..."
-    # Main AXLAP service (manages docker-compose)
     SYSTEMD_AXLAP_SERVICE_FILE="/etc/systemd/system/axlap.service"
     cat << EOF > "${SYSTEMD_AXLAP_SERVICE_FILE}"
 [Unit]
@@ -409,40 +361,42 @@ After=docker.service network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=true
+EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${AXLAP_BASE_DIR}
-# EnvironmentFile=${AXLAP_BASE_DIR}/.env # If .env file contains necessary runtime vars for compose
 ExecStart=${AXLAP_BASE_DIR}/scripts/start_axlap.sh
 ExecStop=${AXLAP_BASE_DIR}/scripts/stop_axlap.sh
-# StandardOutput=append:${AXLAP_BASE_DIR}/logs/axlap-systemd.log
-# StandardError=append:${AXLAP_BASE_DIR}/logs/axlap-systemd.err.log
+StandardOutput=append:${LOG_DIR}/axlap-systemd.log
+StandardError=append:${LOG_DIR}/axlap-systemd.err.log
 TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Auto-update service (rules, feeds)
     SYSTEMD_AXLAP_UPDATES_SERVICE_FILE="/etc/systemd/system/axlap-updates.service"
     cat << EOF > "${SYSTEMD_AXLAP_UPDATES_SERVICE_FILE}"
 [Unit]
 Description=AXLAP Rules and Threat Feeds Updater
-After=axlap.service # Ensure main services are up before trying to update connectors etc.
+After=axlap.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${AXLAP_BASE_DIR}
 ExecStart=${AXLAP_BASE_DIR}/scripts/update_rules_and_feeds.sh
-# StandardOutput=append:${AXLAP_BASE_DIR}/logs/axlap-updates.log
-# StandardError=append:${AXLAP_BASE_DIR}/logs/axlap-updates.err.log
+StandardOutput=append:${LOG_DIR}/axlap-updates.log
+StandardError=append:${LOG_DIR}/axlap-updates.err.log
 EOF
 
     SYSTEMD_AXLAP_UPDATES_TIMER_FILE="/etc/systemd/system/axlap-updates.timer"
     cat << EOF > "${SYSTEMD_AXLAP_UPDATES_TIMER_FILE}"
 [Unit]
-Description=Run AXLAP updater daily
+Description=Run AXLAP updater daily at 3 AM
 
 [Timer]
 OnCalendar=daily
+AccuracySec=1h # Allow some flexibility
+RandomizedDelaySec=600 # Add random delay up to 10 minutes
 Persistent=true # Run on next boot if missed
 Unit=axlap-updates.service
 
@@ -450,95 +404,151 @@ Unit=axlap-updates.service
 WantedBy=timers.target
 EOF
 
+    log "Reloading systemd daemon, enabling and starting AXLAP services..."
     systemctl daemon-reload >> "${LOG_FILE}" 2>&1
     systemctl enable axlap.service >> "${LOG_FILE}" 2>&1
     systemctl enable axlap-updates.timer >> "${LOG_FILE}" 2>&1
-    systemctl start axlap.service >> "${LOG_FILE}" 2>&1 # Should already be up via docker-compose up
+    # Services are started by docker-compose up earlier.
+    # systemctl start axlap.service will run start_axlap.sh which does 'docker-compose up -d'
+    # This is fine, 'up -d' is idempotent.
+    systemctl restart axlap.service >> "${LOG_FILE}" 2>&1 # Ensure it's (re)started correctly with systemd
     systemctl start axlap-updates.timer >> "${LOG_FILE}" 2>&1
+    log "Systemd services configured."
+}
 
-    # 13. Security Hardening (iptables, AppArmor)
-    log "Applying security hardening (iptables, AppArmor)..."
-    # iptables: Basic rules to restrict access to exposed ports to localhost primarily
-    # Example: Allow established, related connections
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    # Allow loopback
-    iptables -A INPUT -i lo -j ACCEPT
-    # Allow SSH (assuming standard port)
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-    # Allow AXLAP TUI access points (if TUI were web-based, not needed for local Curses TUI)
-    # For services exposed on 127.0.0.1 in docker-compose, host firewall doesn't need to manage them directly.
-    # Docker manages its own iptables rules for port forwarding.
-    # What we might want is to restrict *outgoing* connections from containers.
-    # This is complex and usually handled by Docker network policies or more advanced CNI.
-    # For now, ensure Docker's default FORWARD policy is secure (e.g., DROP unless specified).
-    # Default Docker FORWARD chain policy is usually ACCEPT. Consider changing it.
-    # Check current policy: iptables -L FORWARD -v -n
-    # If DOCKER-USER chain exists, rules there are applied before Docker's own rules.
-    # Example: Deny all forwarding by default (then Docker adds its specific allows)
-    # iptables -P FORWARD DROP (This can break things if not careful)
+# --- Main Installation Steps ---
+main() {
+    check_root
+    check_os
 
-    log "iptables rules applied. Consider a more comprehensive firewall setup (e.g., ufw)."
-    # Save iptables rules (depends on distro: iptables-persistent or other methods)
-    # apt-get install -y iptables-persistent >> "${LOG_FILE}" 2>&1
-    # netfilter-persistent save >> "${LOG_FILE}" 2>&1
+    # Create base directory first so log file can be created there
+    mkdir -p "${AXLAP_BASE_DIR}"
+    create_directories # Creates LOG_DIR among others
+    touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
 
-    # AppArmor: Load profiles for containers
-    # This requires writing AppArmor profiles for each custom container and placing them in /etc/apparmor.d/
-    # Then load them: apparmor_parser -r /etc/apparmor.d/your_profile
-    # And set Docker container security opts: --security-opt apparmor=your_profile_name
-    # This is an advanced step. For now, ensure AppArmor is enabled.
-    if systemctl is-active --quiet apparmor; then
-        log "AppArmor service is active. Custom profiles can be added to ${AXLAP_BASE_DIR}/apparmor/ and loaded."
-    else
-        log "WARNING: AppArmor service is not active. Consider enabling it for enhanced security."
+    log "AXLAP installation started. Log file: ${LOG_FILE}"
+
+    log "Step 1: Install System Dependencies..."
+    apt-get update -y >> "${LOG_FILE}" 2>&1
+    apt-get install -y --no-install-recommends \
+        git curl docker.io docker-compose python3 python3-pip python3-venv python3-dev \
+        make iptables apparmor-utils uuid-runtime openssl jq apt-transport-https \
+        ca-certificates gnupg lsb-release libpcap-dev libcurl4-openssl-dev rsync yq net-tools htop \
+        ncurses-dev # For TUI if building any C extensions, or for general dev
+        >> "${LOG_FILE}" 2>&1
+    check_command "docker"
+    check_command "docker-compose"
+    check_command "git"
+    check_command "python3"
+    check_command "pip3"
+    check_command "yq" # Useful for YAML manipulation if needed later
+    log "System dependencies installed."
+
+    log "Step 2: Ensure Docker service is running..."
+    if ! systemctl is-active --quiet docker; then
+        log "Starting Docker service..."
+        systemctl start docker >> "${LOG_FILE}" 2>&1
+        systemctl enable docker >> "${LOG_FILE}" 2>&1
     fi
-    # Example profile path (profiles would need to be created and placed in the repo)
-    # if [ -d "${AXLAP_BASE_DIR}/apparmor" ]; then
-    #   for profile in "${AXLAP_BASE_DIR}/apparmor/"*; do
-    #     if [ -f "$profile" ]; then
-    #       log "Loading AppArmor profile: $profile"
-    #       apparmor_parser -r -W "$profile" || log "Warning: Failed to load AppArmor profile $profile"
-    #     fi
-    #   done
-    # fi
+    log "Docker service is active."
+    log "Docker version: $(docker --version)"
+    log "Docker Compose version: $(docker-compose --version)"
 
-    # 14. Final Instructions
-    log "AXLAP Installation Completed Successfully!"
-    echo ""
-    echo "---------------------------------------------------------------------"
-    echo " AXLAP - Autonomous XKeyscore-Like Analysis Platform Installation   "
-    echo "---------------------------------------------------------------------"
-    echo ""
-    echo "Base Directory: ${AXLAP_BASE_DIR}"
-    echo "Capture Interface: ${CAPTURE_INTERFACE}"
-    echo ""
-    echo "Access Services:"
-    echo "  - AXLAP TUI: Run 'sudo ${AXLAP_BASE_DIR}/venv/bin/python ${AXLAP_BASE_DIR}/src/tui/axlap_tui.py'"
-    echo "    (Or just 'cd ${AXLAP_BASE_DIR} && source venv/bin/activate && python src/tui/axlap_tui.py')"
-    echo "  - Arkime UI: http://127.0.0.1:8005 (Login: admin / AdminAXLAPPassw0rd - CHANGE THIS!)"
-    echo "  - OpenCTI UI: http://127.0.0.1:8080 (Login: ${OPENCTI_ADMIN_EMAIL} / ${OPENCTI_ADMIN_PASSWORD} - CHANGE THIS!)"
-    echo "    OpenCTI API Token: ${OPENCTI_ADMIN_TOKEN}"
-    echo "  - Elasticsearch (Main): http://127.0.0.1:9200"
-    echo ""
-    echo "Service Management:"
-    echo "  - Start AXLAP: sudo systemctl start axlap.service (or use scripts/start_axlap.sh)"
-    echo "  - Stop AXLAP: sudo systemctl stop axlap.service (or use scripts/stop_axlap.sh)"
-    echo "  - Status: sudo systemctl status axlap.service / docker-compose ps"
-    echo "  - Logs: sudo docker-compose logs -f <service_name> (e.g., zeek, suricata)"
-    echo ""
-    echo "Important Notes:"
-    echo "  - REVIEW AND CHANGE DEFAULT PASSWORDS AND SECRETS!"
-    echo "  - Ensure the capture interface '${CAPTURE_INTERFACE}' is correct and traffic is mirrored/spanned if necessary."
-    echo "  - Monitor disk space in '${AXLAP_BASE_DIR}/data', especially for PCAPs and Elasticsearch data."
-    echo "  - Customize Zeek scripts in '${AXLAP_BASE_DIR}/src/zeek_plugins/' as needed."
-    echo "  - Customize Suricata rules in '${AXLAP_BASE_DIR}/rules/local.rules'."
-    echo "  - ML models will improve over time with more data. Trigger training via TUI or script."
-    echo "  - For full network visibility, ensure AXLAP system can see all relevant traffic (e.g., configure TAP or SPAN port)."
-    echo "---------------------------------------------------------------------"
+    log "Step 3: Setup AXLAP Source Files..."
+    setup_axlap_source
+    log "AXLAP source files setup in ${AXLAP_BASE_DIR}."
 
+    log "Step 4: Configure Environment File (.env)..."
+    configure_env_file
+    log ".env file configured."
+
+    log "Step 5: Update Service Configuration Files..."
+    update_configs
+    log "Service configuration files updated."
+
+    log "Step 6: Set Executable Permissions for Scripts..."
+    find "${AXLAP_BASE_DIR}/scripts" -name "*.sh" -exec chmod +x {} \;
+    if [ -f "${AXLAP_BASE_DIR}/src/tui/axlap_tui.py" ]; then
+        chmod +x "${AXLAP_BASE_DIR}/src/tui/axlap_tui.py"
+    fi
+    log "Script permissions set."
+
+    log "Step 7: Build and Pull Docker Images..."
+    log "Building custom Docker images (this may take a while)..."
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" build --pull >> "${LOG_FILE}" 2>&1 # --pull ensures base images are updated
+    log "Pulling remaining official Docker images..."
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" pull >> "${LOG_FILE}" 2>&1
+    log "Docker images are ready."
+
+    log "Step 8: Start All AXLAP Services..."
+    # The .env file is automatically picked up by docker-compose in the same directory
+    docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d >> "${LOG_FILE}" 2>&1
+    log "AXLAP services are starting in detached mode."
+
+    log "Step 9: Wait for Core Services and Initialize..."
+    wait_for_elasticsearch "127.0.0.1:9200" "Main (axlap-elasticsearch)" || log "Continuing despite Main ES not becoming healthy."
+    # OpenCTI's ES is not directly exposed, rely on OpenCTI's own health.
+
+    initialize_arkime # Initializes Arkime DB and adds admin user
+
+    wait_for_opencti || log "Continuing despite OpenCTI not becoming fully available."
+
+    log "Step 10: Setup Python Virtual Environment for Host Tools (TUI, ML scripts)..."
+    setup_python_venv
+
+    log "Step 11: Initial ML Model Training (Optional)..."
+    log "ML Model training can be initiated via TUI or by running: sudo ${AXLAP_BASE_DIR}/scripts/train_ml_model.sh"
+    log "Ensure some network data has been processed by Zeek and ingested into Elasticsearch before first training."
+
+    log "Step 12: Setup Systemd Services..."
+    setup_systemd_services
+
+    log "Step 13: Security Considerations..."
+    log "Basic iptables rules are for host protection. Docker manages its own container network rules."
+    log "Consider using 'ufw' or a more comprehensive firewall setup for the host."
+    # Example: ufw allow ssh; ufw allow http; ufw allow https; ufw default deny incoming; ufw enable
+    log "Ensure AppArmor is enabled on the host. Custom AppArmor profiles for containers can be added for enhanced security."
+    if systemctl is-active --quiet apparmor; then
+        log "AppArmor service is active."
+    else
+        log "WARNING: AppArmor service is not active. Consider enabling it: sudo systemctl enable --now apparmor"
+    fi
+
+    log "Step 14: Final Instructions..."
+    echo "" | tee -a "${LOG_FILE}"
+    echo "---------------------------------------------------------------------" | tee -a "${LOG_FILE}"
+    echo " AXLAP Installation Completed!" | tee -a "${LOG_FILE}"
+    echo "---------------------------------------------------------------------" | tee -a "${LOG_FILE}"
+    echo "" | tee -a "${LOG_FILE}"
+    echo "Base Directory: ${AXLAP_BASE_DIR}" | tee -a "${LOG_FILE}"
+    echo "Capture Interface: ${CAPTURE_INTERFACE}" | tee -a "${LOG_FILE}"
+    echo "Log File: ${LOG_FILE}" | tee -a "${LOG_FILE}"
+    echo "" | tee -a "${LOG_FILE}"
+    echo "Access Services:" | tee -a "${LOG_FILE}"
+    echo "  - AXLAP TUI: cd ${AXLAP_BASE_DIR} && source venv/bin/activate && python3 src/tui/axlap_tui.py" | tee -a "${LOG_FILE}"
+    echo "  - Arkime UI: http://127.0.0.1:8005 (Login: admin / AdminAXLAPPassw0rd - CHANGE THIS!)" | tee -a "${LOG_FILE}"
+    echo "  - OpenCTI UI: http://127.0.0.1:8080 (Login: ${OPENCTI_ADMIN_EMAIL} / ${OPENCTI_ADMIN_PASSWORD} - CHANGE THIS!)" | tee -a "${LOG_FILE}"
+    echo "    OpenCTI API Token (for TUI config or scripts): ${OPENCTI_ADMIN_TOKEN}" | tee -a "${LOG_FILE}"
+    echo "  - Elasticsearch (Main): http://127.0.0.1:9200" | tee -a "${LOG_FILE}"
+    echo "  - MinIO Console (OpenCTI S3): http://127.0.0.1:9001 (User: ${MINIO_ROOT_USER} / Pass: ${MINIO_ROOT_PASSWORD} - CHANGE THIS!)" | tee -a "${LOG_FILE}"
+    echo "" | tee -a "${LOG_FILE}"
+    echo "Service Management (Systemd):" | tee -a "${LOG_FILE}"
+    echo "  - Start AXLAP: sudo systemctl start axlap.service" | tee -a "${LOG_FILE}"
+    echo "  - Stop AXLAP: sudo systemctl stop axlap.service" | tee -a "${LOG_FILE}"
+    echo "  - Status: sudo systemctl status axlap.service" | tee -a "${LOG_FILE}"
+    echo "  - Logs: sudo journalctl -u axlap.service -f" | tee -a "${LOG_FILE}"
+    echo "  - Docker Logs: cd ${AXLAP_BASE_DIR} && sudo docker-compose logs -f <service_name>" | tee -a "${LOG_FILE}"
+    echo "" | tee -a "${LOG_FILE}"
+    echo "Important Notes:" | tee -a "${LOG_FILE}"
+    echo "  - REVIEW AND CHANGE ALL DEFAULT PASSWORDS AND SECRETS IMMEDIATELY!" | tee -a "${LOG_FILE}"
+    echo "  - Ensure network traffic is correctly mirrored/spanned to the '${CAPTURE_INTERFACE}' interface." | tee -a "${LOG_FILE}"
+    echo "  - Monitor disk space in '${AXLAP_BASE_DIR}/data'." | tee -a "${LOG_FILE}"
+    echo "  - Customize Zeek scripts in '${AXLAP_BASE_DIR}/src/zeek_plugins/' and '${AXLAP_BASE_DIR}/config/zeek/site/local.zeek'." | tee -a "${LOG_FILE}"
+    echo "  - Add custom Suricata rules to '${AXLAP_BASE_DIR}/config/suricata/rules/local.rules' (or similar path configured in suricata.yaml)." | tee -a "${LOG_FILE}"
+    echo "---------------------------------------------------------------------" | tee -a "${LOG_FILE}"
 }
 
 # --- Script Execution ---
-main "$@" || exit 1
+main "$@"
 
 exit 0

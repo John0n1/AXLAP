@@ -1,37 +1,20 @@
 # axlap/config/elasticsearch/elasticsearch.yml
 cluster.name: "axlap-es-cluster"
-node.name: axlap-es-node1
-network.host: 0.0.0.0 # Binds to all interfaces within the container
-# discovery.seed_hosts: [] # Not needed for single-node
-# cluster.initial_master_nodes: ["axlap-es-node1"] # For single-node
-
-# Optional: Define custom paths if not using defaults
-# path.data: /usr/share/elasticsearch/data
-# path.logs: /usr/share/elasticsearch/logs
-
-# HTTP settings
+node.name: "axlap-es-node1"
+network.host: 0.0.0.0
 http.port: 9200
 
-# X-Pack security (disabled in docker-compose for simplicity, enable for production)
 xpack.security.enabled: false
-# xpack.security.transport.ssl.enabled: false
-# xpack.security.http.ssl.enabled: false
 
-# Performance settings (some are in docker-compose env vars)
-# indices.memory.index_buffer_size: 10%
-# indices.queries.cache.size: 10%
+# Performance settings - consider adjusting based on available system resources
+# These are often set via ES_JAVA_OPTS in docker-compose.yml for heap,
+# but other settings like caches can be put here.
+# indices.memory.index_buffer_size: 10% # Default is 10% of total heap
+# indices.queries.cache.size: 10% # Default is 10% of total heap
 
-# CORS settings (if TUI or other components need cross-origin access, though TUI is local)
-# http.cors.enabled: true
-# http.cors.allow-origin: "*" # Restrict this in production
-# http.cors.allow-headers: "X-Requested-With,Content-Type,Content-Length,Authorization"
-
-# Enable detailed circuit breaker logging for troubleshooting
-# logger.org.elasticsearch.indices.breaker: TRACE
-
-# Enable slow query logging (adjust thresholds as needed)
-# index.search.slowlog.threshold.query.warn: 10s
+# Slow query logging - useful for identifying performance bottlenecks
 index.search.slowlog.threshold.query.info: 5s
+# index.search.slowlog.threshold.query.warn: 10s
 # index.search.slowlog.threshold.query.debug: 2s
-# index.search.slowlog.threshold.query.trace: 1s
-# index.search.slowlog.level: info
+# index.search.slowlog.threshold.fetch.info: 1s
+# index.indexing.slowlog.threshold.index.info: 5s

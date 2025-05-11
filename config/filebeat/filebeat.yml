@@ -26,7 +26,7 @@ filebeat.inputs:
     - add_fields:
         target: event
         fields:
-          kind: "suricata_alert" # To help differentiate
+          kind: "suricata_event" # To help differentiate
     - if:  # Extract rule name and severity for easier querying
         contains:
           json.event_type: "alert"
@@ -34,10 +34,28 @@ filebeat.inputs:
         - rename:
             fields:
               - from: "json.alert.signature"
-                to: "rule_name"
+                to: "rule.name"
               - from: "json.alert.severity"
-                to: "severity"
-    # Add more processing for Suricata fields if needed
+                to: "rule.severity"
+              - from: "json.alert.category"
+                to: "rule.category"
+        - script:
+            lang: javascript
+            source: >
+              function process(event) {
+                var alert = event.Get("json.alert");
+                if (alert && alert.gid && alert.signature_id && alert.rev) {
+                  event.Put("rule.id", alert.gid + ":" + alert.signature_id + ":" + alert.rev);
+                }
+              }
+    - if:
+        contains:
+          json.event_type: "flow"
+      then:
+        - add_fields:
+            target: event
+            fields:
+              kind: "suricata_flow"
 
 - type: log # For AXLAP custom Zeek logs
   enabled: true
@@ -47,7 +65,11 @@ filebeat.inputs:
   json.add_error_key: true
   json.message_key: message
   tags: ["zeek", "axlap_custom"] # Tag for custom logs
-  # Add processors if needed, e.g., to extract specific fields
+  processors:
+    - add_fields:
+        target: event
+        fields:
+          kind: "zeek_custom_log"
 
 # General Filebeat settings
 filebeat.config.modules:
@@ -67,12 +89,20 @@ output.elasticsearch:
     - index: "axlap-suricata-%{+yyyy.MM.dd}"
       when.contains:
         tags: "suricata"
-  # template.name: "axlap-filebeat"
-  # template.pattern: "axlap-*"
-  # template.overwrite: true # If you have a custom template
+  # Consider setting up an ILM policy in Elasticsearch and referencing it here
+  # for better index lifecycle management (e.g., rollover, deletion).
+  # ilm.enabled: true
+  # ilm.policy_name: "axlap-filebeat-policy"
+  # ilm.rollover_alias: "axlap-zeek"
+  # ilm.pattern: "{now/d}-000001"
+
+  # Template for custom mappings and settings (optional but recommended for production)
+  # setup.template.name: "axlap-filebeat"
+  # setup.template.pattern: "axlap-*"
+  # setup.template.overwrite: true
   # setup.template.settings:
   #   index.number_of_shards: 1 # For single node ES cluster
-  #   index.codec: best_compression # For saving space
+  #   index.codec: best_compression # For saving space, trades some indexing speed
 
 # Logging
 logging.level: info
@@ -82,21 +112,3 @@ logging.files:
   name: filebeat
   keepfiles: 7
   permissions: 0644
-
-# ... (in filebeat.yml)
-# - type: log
-#   enabled: true
-#   paths:
-#     - /var/log/zeek_json/axlap_http_detailed.log
-#   json.keys_under_root: true
-#   json.add_error_key: true
-#   tags: ["zeek", "axlap_http_detailed"]
-#   # ... processors ...
-# - type: log
-#   enabled: true
-#   paths:
-#     - /var/log/zeek_json/axlap_conn_stats.log
-#   json.keys_under_root: true
-#   json.add_error_key: true
-#   tags: ["zeek", "axlap_conn_stats"]
-#   # ... processors ...
