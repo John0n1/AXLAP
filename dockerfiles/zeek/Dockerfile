@@ -1,8 +1,6 @@
 FROM ubuntu:22.04
 
-ARG ZEEK_VERSION=5.0.8 # Choose a stable Zeek version
-# For Zeek 6+, JSON logging is more streamlined. Using 5.0.8 for wider compatibility.
-
+ARG ZEEK_VERSION=5.0.8 # Consider using a newer stable version if available and compatible
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     swig \
     libssl-dev \
-    libGeoIP-dev \
+    libgeoip-dev \
     libpcap-dev \
     libmaxminddb-dev \
     python3 \
@@ -24,22 +22,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     bison \
     flex \
+    # For Zeek 6+ Python bindings, ensure Python version is >= 3.7
+    # Additional dependencies for plugins might be needed here (e.g., libyara-dev)
     && rm -rf /var/lib/apt/lists/*
 
 # Install Zeek from source
-RUN mkdir /opt/zeek_src && cd /opt/zeek_src \
-    && curl -sSL https://download.zeek.org/zeek-${ZEEK_VERSION}.tar.gz -o zeek-${ZEEK_VERSION}.tar.gz \
-    && tar -xzf zeek-${ZEEK_VERSION}.tar.gz \
-    && cd zeek-${ZEEK_VERSION} \
-    && ./configure --prefix=/usr/local/zeek --disable-broker --disable-jemalloc --enable-json-logs --enable-af-packet \
-    && make -j$(nproc) \
-    && make install \
-    && cd / && rm -rf /opt/zeek_src
+RUN mkdir -p /opt/zeek_src && cd /opt/zeek_src && \
+    curl -sSL "https://download.zeek.org/zeek-${ZEEK_VERSION}.tar.gz" -o "zeek-${ZEEK_VERSION}.tar.gz" && \
+    tar -xzf "zeek-${ZEEK_VERSION}.tar.gz" && \
+    cd "zeek-${ZEEK_VERSION}" && \
+    # --disable-broker if not using Broker for clustering (common for single node AXLAP)
+    # --enable-json-logs is default in newer Zeeks but good to be explicit
+    # --enable-af-packet for AF_PACKET v3 support
+    ./configure --prefix=/usr/local/zeek --disable-broker --enable-json-logs --enable-af-packet && \
+    make -j$(nproc) && \
+    make install && \
+    cd / && rm -rf /opt/zeek_src
 
-# Set up Zeek environment
 ENV PATH="/usr/local/zeek/bin:${PATH}"
 
-# Create necessary directories for Zeek
+# Create necessary directories for Zeek runtime and AXLAP specifics
+# These paths should align with volume mounts in docker-compose.yml
 RUN mkdir -p /usr/local/zeek/spool \
     && mkdir -p /usr/local/zeek/logs \
     && mkdir -p /var/log/zeek_json \
@@ -47,73 +50,106 @@ RUN mkdir -p /usr/local/zeek/spool \
     && mkdir -p /opt/axlap/zeek_plugins \
     && mkdir -p /opt/axlap/threat_intel
 
-# Copy Zeek configurations
-COPY ./config/zeek/node.cfg /usr/local/zeek/etc/node.cfg
-COPY ./config/zeek/networks.cfg /usr/local/zeek/etc/networks.cfg
-# local.zeek will be mounted to /usr/local/zeek/share/zeek/site/local.zeek
-
-# ZeekControl setup
-RUN echo "export PATH=/usr/local/zeek/bin:\$PATH" >> /etc/bash.bashrc
+# ZeekControl setup - `zeekctl install` sets up initial configs like zeekctl.cfg
+# It uses /usr/local/zeek/etc/zeekctl.cfg.template
 RUN /usr/local/zeek/bin/zeekctl install
 
-# Expose ZEEK_LOG_JSON for local.zeek or scripts to potentially use
-ARG ZEEK_INTERFACE=eth0
-ENV ZEEK_INTERFACE=${ZEEK_INTERFACE}
+# Environment variables from .env via docker-compose
+ENV ZEEK_INTERFACE="${ZEEK_INTERFACE_FROM_ENV:-eth0}"
+ENV LOCAL_NETS="${LOCAL_NETS_FROM_ENV:-192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
 
-# Configure logging directory in zeekctl.cfg
-RUN sed -i "s|^LogDir.*|LogDir = /usr/local/zeek/logs|" /usr/local/zeek/etc/zeekctl.cfg \
-    && sed -i "s|^SpoolDir.*|SpoolDir = /usr/local/zeek/spool|" /usr/local/zeek/etc/zeekctl.cfg \
-    # Configure Zeek to output JSON logs to the mounted volume
-    # This can also be done via local.zeek: redef Log::logdir = "/var/log/zeek_json";
-    # And ensuring JSON output: redef Log::default_log_writer = Log::WRITER_JSON;
-    # Here, we assume local.zeek handles these definitions.
-    # Add mail_dest to avoid zeekctl warnings, even if not sending mail
-    && echo "MailTo = root@localhost" >> /usr/local/zeek/etc/zeekctl.cfg \
-    && echo "LogRotationInterval = 3600" >> /usr/local/zeek/etc/zeekctl.cfg \ 
-    && echo "JsonLog::enable = T" >> /usr/local/zeek/etc/zeekctl.cfg # For zkg packages using JsonLog module \
-    && echo "LocalSite::local_nets += { ${LOCAL_NETS_FROM_ENV:-192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12} }" >> /usr/local/zeek/share/zeek/site/local.zeek
-    # The line above for LocalSite::local_nets is an example; networks.cfg is primary.
+# Modify zeekctl.cfg for AXLAP specifics
+# LogDir and SpoolDir are standard Zeek log/spool locations, not where JSON logs go.
+# JSON log output dir is controlled by `Log::logdir` in local.zeek.
+RUN sed -i "s|^LogDir.*|LogDir = /usr/local/zeek/logs|" /usr/local/zeek/etc/zeekctl.cfg && \
+    sed -i "s|^SpoolDir.*|SpoolDir = /usr/local/zeek/spool|" /usr/local/zeek/etc/zeekctl.cfg && \
+    echo "MailTo = root@localhost" >> /usr/local/zeek/etc/zeekctl.cfg && \
+    echo "LogRotationInterval = 3600" >> /usr/local/zeek/etc/zeekctl.cfg
+    # JsonLog::enable = T is for a specific zkg package, not core Zeek JSON logging.
+    # Core JSON logging is enabled via `redef Log::default_log_writer = Log::WRITER_JSON;` in local.zeek.
 
-# Entrypoint script to start Zeek
+# Entrypoint script to configure and start Zeek
 COPY <<EOF /usr/local/bin/entrypoint.sh
 #!/bin/bash
 set -e
 
-echo "AXLAP Zeek Entrypoint"
-echo "ZEEK_INTERFACE: \${ZEEK_INTERFACE}"
-echo "Configuring Zeek interface in node.cfg..."
-sed -i "s|interface=.*|interface=\${ZEEK_INTERFACE}|" /usr/local/zeek/etc/node.cfg
+echo "[$(date)] AXLAP Zeek Entrypoint Initializing..."
+LOG_INIT_ZEEK="/var/log/zeek_json/init.log" # Log to a file in the mounted log volume
 
-# Ensure site/local.zeek is present from volume mount, otherwise create a basic one
+echo "Zeek Interface: ${ZEEK_INTERFACE}" | tee -a "${LOG_INIT_ZEEK}"
+echo "Local Networks: ${LOCAL_NETS}" | tee -a "${LOG_INIT_ZEEK}"
+
+# Configure Zeek interface in node.cfg
+# node.cfg is typically mounted from the host at /usr/local/zeek/etc/node.cfg
+# If it's not mounted but copied during build, this modification is fine.
+# If mounted, changes here might not persist if the mounted file is read-only or overwritten.
+# Best practice: mount node.cfg and ensure it uses ${ZEEK_INTERFACE_FROM_ENV} or this script updates the mounted copy.
+# For now, assume it's okay to modify the one in the container, which might be a copy or a mount.
+if [ -f /usr/local/zeek/etc/node.cfg ]; then
+    sed -i "s|^interface=.*|interface=${ZEEK_INTERFACE}|" /usr/local/zeek/etc/node.cfg
+    echo "Updated interface in /usr/local/zeek/etc/node.cfg to ${ZEEK_INTERFACE}" | tee -a "${LOG_INIT_ZEEK}"
+else
+    echo "WARNING: /usr/local/zeek/etc/node.cfg not found. Interface configuration might be incorrect." | tee -a "${LOG_INIT_ZEEK}"
+fi
+
+# Configure networks.cfg with LOCAL_NETS
+# networks.cfg is typically mounted from host at /usr/local/zeek/etc/networks.cfg
+if [ -f /usr/local/zeek/etc/networks.cfg ]; then
+    echo "# Networks configuration for Zeek - populated by entrypoint.sh" > /usr/local/zeek/etc/networks.cfg
+    IFS=',' read -ra NET_ARRAY <<< "${LOCAL_NETS}"
+    for net_cidr in "${NET_ARRAY[@]}"; do
+        echo "${net_cidr}" >> /usr/local/zeek/etc/networks.cfg
+    done
+    echo "Updated /usr/local/zeek/etc/networks.cfg with: ${LOCAL_NETS}" | tee -a "${LOG_INIT_ZEEK}"
+else
+    echo "WARNING: /usr/local/zeek/etc/networks.cfg not found. Local network configuration might be incorrect." | tee -a "${LOG_INIT_ZEEK}"
+fi
+
+# Ensure site/local.zeek is present (mounted from host)
 if [ ! -f "/usr/local/zeek/share/zeek/site/local.zeek" ]; then
-    echo "Error: /usr/local/zeek/share/zeek/site/local.zeek not found. Mount config/zeek to this location."
+    echo "ERROR: /usr/local/zeek/share/zeek/site/local.zeek not found. Mount your site configuration." | tee -a "${LOG_INIT_ZEEK}"
     exit 1
 fi
-# Ensure plugin directory is accessible
+
+# Ensure custom plugin directory is accessible (mounted from host)
 if [ ! -d "/opt/axlap/zeek_plugins" ]; then
-    echo "Warning: /opt/axlap/zeek_plugins not found."
+    echo "Warning: Custom plugin directory /opt/axlap/zeek_plugins not found (expected to be mounted)." | tee -a "${LOG_INIT_ZEEK}"
 fi
 
-# Ensure log directory exists and has correct permissions for zeek user
-if getent passwd zeek > /dev/null 2>&1; then
-    mkdir -p /var/log/zeek_json
-    chown -R zeek:zeek /var/log/zeek_json
-else
-    echo "Warning: 'zeek' user not found. Ensure correct permissions for log directory if needed."
+# Ensure log directory for JSON logs exists and has correct permissions if Zeek runs as non-root.
+# ZeekControl often runs workers as user 'zeek'.
+mkdir -p /var/log/zeek_json
+if id zeek &>/dev/null; then
+    chown -R zeek:zeek /var/log/zeek_json || echo "Warning: Could not chown /var/log/zeek_json for user zeek." | tee -a "${LOG_INIT_ZEEK}"
+    chown -R zeek:zeek /usr/local/zeek/spool || echo "Warning: Could not chown /usr/local/zeek/spool for user zeek." | tee -a "${LOG_INIT_ZEEK}"
 fi
 
-# Check zeekctl config and install if needed
-echo "Running zeekctl install..." && /usr/local/zeek/bin/zeekctl install || echo "Zeekctl install may have non-fatal errors, continuing..."
+# Check zeekctl configuration. `zeekctl install` should have been run during build.
+# `zeekctl check` can identify issues before deploying.
+echo "Running 'zeekctl check'..." | tee -a "${LOG_INIT_ZEEK}"
+if ! /usr/local/zeek/bin/zeekctl check; then
+    echo "WARNING: 'zeekctl check' reported issues. Attempting to deploy anyway..." | tee -a "${LOG_INIT_ZEEK}"
+fi
 
-# Deploy Zeek using zeekctl
-echo "Deploying Zeek..."
-/usr/local/zeek/bin/zeekctl deploy
+# Deploy Zeek using zeekctl (starts Zeek processes)
+echo "Deploying Zeek using 'zeekctl deploy'..." | tee -a "${LOG_INIT_ZEEK}"
+/usr/local/zeek/bin/zeekctl deploy || { echo "ERROR: 'zeekctl deploy' failed. Check Zeek logs in /usr/local/zeek/spool/ and ${LOG_INIT_ZEEK}."; exit 1; }
 
-# Keep container running and show logs
-echo "Tailing Zeek manager log..."
-tail -F /usr/local/zeek/spool/manager/current.status /usr/local/zeek/spool/manager/*.log /var/log/zeek_json/*
+echo "Zeek deployed successfully." | tee -a "${LOG_INIT_ZEEK}"
+
+# Keep container running and tail relevant logs for `docker logs`
+# Tailing current.log from manager and all .log files in the JSON output directory.
+echo "Tailing Zeek logs. Main Zeek logs are in /usr/local/zeek/spool/manager/ and JSON logs in /var/log/zeek_json/..." | tee -a "${LOG_INIT_ZEEK}"
+tail -F /usr/local/zeek/spool/manager/current.log /usr/local/zeek/spool/manager/*.log /var/log/zeek_json/*.log /var/log/zeek_json/*/*.log 2>/dev/null &
+
+# Keep the entrypoint script running; Zeek processes are managed by zeekctl in background.
+# A common way to keep a script running is to wait on the child process (tail)
+wait %1
+# If tail exits, the container will stop. This is usually desired.
+echo "Zeek entrypoint finished or tail process ended." | tee -a "${LOG_INIT_ZEEK}"
+
 EOF
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD [] # Not needed due to entrypoint
+# CMD is not needed as ENTRYPOINT handles the Zeek lifecycle via zeekctl and tailing logs.

@@ -3,7 +3,7 @@
 # AXLAP - Autonomous XKeyscore-Like Analysis Platform
 # Installation Script
 
-set -e # Exit immediately if a command exits with a non-zero status.
+set -o pipefail # Exit immediately if a command exits with a non-zero status.
 
 # --- Configuration ---
 AXLAP_BASE_DIR="${AXLAP_INSTALL_DIR:-/opt/axlap}" # Allow overriding base directory
@@ -66,8 +66,14 @@ check_os() {
         log "WARNING: This script is primarily tested on Ubuntu. Your OS might require manual adjustments."
     fi
     source /etc/os-release
-    if [[ "$(echo \"$VERSION_ID\" | cut -d. -f1)" -lt "20" ]]; then
-        log "WARNING: Ubuntu 20.04 or newer is strongly recommended. Your version: $VERSION_ID"
+    local major_version_id
+    major_version_id=$(echo "${VERSION_ID:-0}" | cut -d. -f1) # Default to 0 if VERSION_ID is not set
+    
+    # Ensure major_version_id is a number before comparison
+    if [[ "${major_version_id}" =~ ^[0-9]+$ ]] && [ "${major_version_id}" -lt "20" ]; then
+        log "WARNING: Ubuntu 20.04 or newer is strongly recommended. Your version: ${VERSION_ID:-N/A}"
+    elif ! [[ "${major_version_id}" =~ ^[0-9]+$ ]]; then
+        log "WARNING: Could not determine Ubuntu major version. Your VERSION_ID: ${VERSION_ID:-N/A}"
     fi
 }
 
@@ -101,10 +107,14 @@ create_directories() {
     # Elasticsearch container runs as user elasticsearch (uid 1000)
     # This is often handled by Docker volume mounts, but explicit chown can prevent issues.
     if [ -d "${AXLAP_BASE_DIR}/data/elasticsearch_data" ]; then
+        log "Setting permissions for ${AXLAP_BASE_DIR}/data/elasticsearch_data..."
         chown -R 1000:1000 "${AXLAP_BASE_DIR}/data/elasticsearch_data" || log "Warning: Could not chown elasticsearch_data. Check permissions."
+        chmod -R g+w "${AXLAP_BASE_DIR}/data/elasticsearch_data" || log "Warning: Could not chmod elasticsearch_data."
     fi
     if [ -d "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" ]; then
+        log "Setting permissions for ${AXLAP_BASE_DIR}/data/opencti_data/es_octi..."
         chown -R 1000:1000 "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" || log "Warning: Could not chown opencti_data/es_octi. Check permissions."
+        chmod -R g+w "${AXLAP_BASE_DIR}/data/opencti_data/es_octi" || log "Warning: Could not chmod opencti_data/es_octi."
     fi
 }
 
@@ -259,12 +269,19 @@ wait_for_elasticsearch() {
     log "Waiting for ${service_name} Elasticsearch (${es_host_port}) to be healthy..."
     MAX_WAIT=300 # 5 minutes
     COUNT=0
+    log "Waiting for ${service_name} Elasticsearch (${es_host_port}) to be healthy..."
+    # Corrected service name in the log guidance for docker-compose logs
+    local docker_compose_service_name="axlap-elasticsearch" # Actual service name for docker-compose
+    if [[ "${service_name}" == *"OpenCTI"* ]]; then
+        docker_compose_service_name="axlap-opencti-es"
+    fi
+
     while ! curl -s -k "http://${es_host_port}/_cluster/health?wait_for_status=yellow&timeout=10s" > /dev/null 2>&1; do
         sleep 10
         COUNT=$((COUNT + 10))
         if [ "$COUNT" -ge "$MAX_WAIT" ]; then
             log "ERROR: ${service_name} Elasticsearch (${es_host_port}) did not become healthy in time."
-            log "Run 'docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs ${service_name}' for details."
+            log "Run 'sudo docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs ${docker_compose_service_name}' for details."
             return 1 # Failure
         fi
         printf "."
@@ -307,12 +324,16 @@ wait_for_opencti() {
     MAX_WAIT_OPENCTI=600 # 10 minutes, OpenCTI can take a while
     COUNT=0
     # Check for a 200 OK on the /graphql endpoint with a basic query
-    while ! curl -s -k -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/graphql -H "Content-Type: application/json" --data-binary '{"query":"{ about { version } }"}' | grep -q "200"; do
+    # Ensure the curl command is robust and quoting is correct
+    OPENCTI_GRAPHQL_URL="http://127.0.0.1:8080/graphql"
+    GRAPHQL_QUERY='{"query":"{ about { version } }"}'
+
+    while ! curl -s -k -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" --data "${GRAPHQL_QUERY}" "${OPENCTI_GRAPHQL_URL}" | grep -q "200"; do
         sleep 15
         COUNT=$((COUNT + 15))
         if [ "$COUNT" -ge "$MAX_WAIT_OPENCTI" ]; then
-            log "ERROR: OpenCTI platform (http://127.0.0.1:8080) did not become available in time."
-            log "Run 'docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs opencti opencti-worker opencti-elasticsearch' for details."
+            log "ERROR: OpenCTI platform (${OPENCTI_GRAPHQL_URL}) did not become available in time."
+            log "Run 'sudo docker-compose -f \"${DOCKER_COMPOSE_FILE}\" logs opencti opencti-worker axlap-opencti-es' for details."
             return 1
         fi
         printf "o"
@@ -418,13 +439,13 @@ EOF
 
 # --- Main Installation Steps ---
 main() {
+    # Create base directory and log directory/file first
+    mkdir -p "${AXLAP_BASE_DIR}" # Ensure base directory exists
+    mkdir -p "${LOG_DIR}"       # Ensure log directory exists
+    touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}" # Create log file with restricted permissions
+
     check_root
     check_os
-
-    # Create base directory first so log file can be created there
-    mkdir -p "${AXLAP_BASE_DIR}"
-    create_directories # Creates LOG_DIR among others
-    touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
 
     log "AXLAP installation started. Log file: ${LOG_FILE}"
 
@@ -475,9 +496,27 @@ main() {
 
     log "Step 7: Build and Pull Docker Images..."
     log "Building custom Docker images (this may take a while)..."
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" build --pull >> "${LOG_FILE}" 2>&1 # --pull ensures base images are updated
-    log "Pulling remaining official Docker images..."
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" pull >> "${LOG_FILE}" 2>&1
+    # Show build output directly to console for easier debugging if it fails
+    # The full output will still be in LOG_FILE if the script continues past this or if tee is used.
+    echo "---------------------------------------------------------------------"
+    echo " Docker Compose Build Output (also logged to ${LOG_FILE})            "
+    echo "---------------------------------------------------------------------"
+    if docker-compose -f "${DOCKER_COMPOSE_FILE}" build --pull 2>&1 | tee -a "${LOG_FILE}"; then
+        log "Custom Docker images built successfully."
+    else
+        log "ERROR: Docker Compose build failed. See output above and check ${LOG_FILE} for full details."
+        echo "ERROR: Docker Compose build failed. Check the output above and the log file: ${LOG_FILE}" >&2
+        exit 1 # Explicitly exit if build fails
+    fi
+    echo "---------------------------------------------------------------------"
+
+    log "Pulling remaining official Docker images (if any specified without a local build context)..."
+    if docker-compose -f "${DOCKER_COMPOSE_FILE}" pull >> "${LOG_FILE}" 2>&1; then
+        log "Docker images pulled successfully."
+    else
+        log "WARNING: Docker Compose pull command encountered an issue. Some images might not be up-to-date. Check ${LOG_FILE}."
+        # Not exiting here as some images might have pulled successfully, or it might be non-critical.
+    fi
     log "Docker images are ready."
 
     log "Step 8: Start All AXLAP Services..."

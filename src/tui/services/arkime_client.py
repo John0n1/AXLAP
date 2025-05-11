@@ -1,10 +1,10 @@
 import requests
 import json
+# from base64 import b64encode # Uncomment if basic auth example is used
 
 class ArkimeClient:
     def __init__(self, config):
-        self.config = config
-        self.base_url = f"http://{config['ARKIME_HOST']}:{config['ARKIME_PORT']}"  # Assuming host and port in config
+        # Extract Arkime connection details from the TUI config object
         self.verify_ssl = config.get('ARKIME_VERIFY_SSL', False)  # Option to disable SSL verification (for self-signed certs)
         # Add authentication if needed (e.g., API key or user/pass)
         # self.auth = (config['ARKIME_USER'], config['ARKIME_PASSWORD'])  # Example with basic auth

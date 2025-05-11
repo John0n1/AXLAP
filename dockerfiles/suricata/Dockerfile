@@ -19,125 +19,123 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic-dev \
     libmaxminddb-dev \
     libhtp-dev \
-    # For Rust based components if building Suricata from source later versions
+    jq \
+    # For Rust based components if building Suricata from source or for some plugins
     # rustc cargo \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Suricata from PPA for latest stable version
-RUN add-apt-repository -y ppa:oisf/suricata-stable
-RUN apt-get update && apt-get install -y suricata suricata-update jq
+# Install Suricata from PPA for a recent stable version
+RUN add-apt-repository -y ppa:oisf/suricata-stable && \
+    apt-get update && \
+    apt-get install -y suricata suricata-update
 
 # Create necessary directories
+# /var/log/suricata for eve.json and suricata.log
+# /etc/suricata for configuration (suricata.yaml, classification.config, etc.)
+# /var/lib/suricata/rules for rules downloaded by suricata-update
+# /var/run/suricata for PID file if Suricata manages it (though not typical for Docker foreground)
 RUN mkdir -p /var/log/suricata \
     && mkdir -p /etc/suricata/rules \
     && mkdir -p /var/lib/suricata/rules \
-    && mkdir -p /var/run/suricata # For PID file if managed by Suricata itself
+    && mkdir -p /var/run/suricata
 
-# suricata-update will download rules to /var/lib/suricata/rules
-# and create a suricata.rules file there.
-# We need to make sure suricata.yaml points to it or symlink it.
+# Environment variables that will be passed from docker-compose.yml (via .env)
+# These are defaults if not provided by the .env file.
+ENV SURICATA_INTERFACE="${SURICATA_INTERFACE_FROM_ENV:-eth0}"
+ENV HOME_NET_CONFIG="${HOME_NETS_CONFIG_SURICATA:-[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]}"
 
-ARG SURICATA_INTERFACE=eth0
-ENV SURICATA_INTERFACE=${SURICATA_INTERFACE}
-ENV HOME_NET_CONFIG="[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,172.28.0.0/16]"
- # Default, set by install.sh
-
+# Copy the entrypoint script into the container
 COPY <<EOF /usr/local/bin/entrypoint.sh
 #!/bin/bash
 set -e
 
-echo "AXLAP Suricata Entrypoint"
-echo "SURICATA_INTERFACE: \${SURICATA_INTERFACE}"
-echo "HOME_NET_CONFIG: \${HOME_NET_CONFIG}"
+echo "[$(date)] AXLAP Suricata Entrypoint Initializing..."
 
-# Check if suricata.yaml is mounted
-if [ ! -f "/etc/suricata/suricata.yaml" ]; then
-    echo "Error: /etc/suricata/suricata.yaml not found. Mount config/suricata to /etc/suricata."
+SURICATA_CONFIG_FILE_TEMPLATE="/etc/suricata/suricata.yaml" # This is the mounted config file
+SURICATA_CONFIG_FILE_RUNTIME="/tmp/suricata_runtime.yaml"
+LOG_INIT_SURICATA="/var/log/axlap_suricata_init/init.log" # Mounted from host
+
+mkdir -p /var/log/axlap_suricata_init # Ensure log dir for this script exists
+
+echo "Suricata Interface: \${SURICATA_INTERFACE}" | tee -a "\${LOG_INIT_SURICATA}"
+echo "Home Net Config: \${HOME_NET_CONFIG}" | tee -a "\${LOG_INIT_SURICATA}"
+
+if [ ! -f "\${SURICATA_CONFIG_FILE_TEMPLATE}" ]; then
+    echo "ERROR: Suricata configuration template \${SURICATA_CONFIG_FILE_TEMPLATE} not found. Mount it correctly." | tee -a "\${LOG_INIT_SURICATA}"
     exit 1
 fi
 
-# Update HOME_NET and interface in suricata.yaml
-# Using jq for robust YAML manipulation is better, but sed for simplicity here.
-# Ensure this doesn't corrupt the YAML.
-# It's safer to use a tool like yq or pass these as env vars if suricata.yaml supports it.
-# For now, directly modifying.
+# Create a runtime copy of the configuration to modify
+cp "\${SURICATA_CONFIG_FILE_TEMPLATE}" "\${SURICATA_CONFIG_FILE_RUNTIME}"
 
-# Create a temporary copy to modify
-cp /etc/suricata/suricata.yaml /tmp/suricata.yaml
-
-# Modify HOME_NET
-# The HOME_NET variable in suricata.yaml might be complex.
-# This simple sed might not work if it's multi-line or heavily commented.
-# A better approach is to have a template suricata.yaml and fill it.
-# Or use Suricata's variable override mechanisms if available (e.g., environment variables).
-# For now:
-ESCAPED_HOME_NET=$(echo "${HOME_NET_CONFIG}" | sed 's/[&/\]/\\&/g')
-sed -i "s|^ *HOME_NET:.*|HOME_NET: \"${ESCAPED_HOME_NET}\"|" /tmp/suricata.yaml
-echo "HOME_NET set to: ${ESCAPED_HOME_NET}"
-
-# Modify af-packet interface
-sed -i "/af-packet:/,/^ *$/s|interface: .*|interface: ${SURICATA_INTERFACE}|" /tmp/suricata.yaml
-echo "AF-PACKET interface set to: ${SURICATA_INTERFACE}"
-
-# Check if rule path exists
-if [ ! -d "/var/lib/suricata/rules" ]; then
-    mkdir -p /var/lib/suricata/rules
-fi
-if [ ! -d "/etc/suricata/rules" ]; then
-    mkdir -p /etc/suricata/rules
+# Modify HOME_NET in the runtime configuration using yq for safety if available, else sed.
+# suricata.yaml expects HOME_NET: "[cidr1, cidr2]"
+if command -v yq &>/dev/null; then
+    yq e ".vars.address-groups.HOME_NET = \"\${HOME_NET_CONFIG}\"" -i "\${SURICATA_CONFIG_FILE_RUNTIME}"
+    echo "HOME_NET updated in \${SURICATA_CONFIG_FILE_RUNTIME} using yq." | tee -a "\${LOG_INIT_SURICATA}"
+else
+    echo "yq not found, using sed to update HOME_NET (less robust)." | tee -a "\${LOG_INIT_SURICATA}"
+    # This sed command is fragile; yq is preferred.
+    # It assumes HOME_NET is under vars.address-groups and is a simple string replacement.
+    ESCAPED_HOME_NET_CONFIG=$(echo "\${HOME_NET_CONFIG}" | sed 's/[&/\\]/\\&/g') # Escape for sed
+    sed -i "s|^ *HOME_NET:.*|HOME_NET: \"\${ESCAPED_HOME_NET_CONFIG}\"|" "\${SURICATA_CONFIG_FILE_RUNTIME}" 
 fi
 
-# Update Suricata rules
-echo "Updating Suricata rules with suricata-update..."
-suricata-update --suricata-conf /tmp/suricata.yaml \
-    --no-enable-conf /etc/suricata/enable.conf \
-    --no-disable-conf /etc/suricata/disable.conf \
-    --no-modify-conf /etc/suricata/modify.conf \
-    --no-drop-conf /etc/suricata/drop.conf \
-    || echo "suricata-update failed, continuing with existing rules if any."
+# Modify af-packet interface in the runtime configuration
+# Assuming af-packet is the chosen capture method and interface is a top-level key under an af-packet list item.
+if command -v yq &>/dev/null; then
+    # This yq command assumes a structure like: af-packet: [{interface: eth0, ...}, ...]
+    # It will update the first interface found. If multiple af-packet sections, adjust accordingly.
+    yq e '(.af-packet.[] | select(.interface) | .interface) = "\${SURICATA_INTERFACE}"' -i "\${SURICATA_CONFIG_FILE_RUNTIME}"
+    echo "AF-PACKET interface updated to \${SURICATA_INTERFACE} in \${SURICATA_CONFIG_FILE_RUNTIME} using yq." | tee -a "\${LOG_INIT_SURICATA}"
+else
+    echo "yq not found, using sed to update af-packet interface (less robust)." | tee -a "\${LOG_INIT_SURICATA}"
+    sed -i "/af-packet:/,/^ *$/s|interface: .*|interface: \${SURICATA_INTERFACE}|" "\${SURICATA_CONFIG_FILE_RUNTIME}"
+fi
 
-# Symlink the main rules file if suricata-update puts it in /var/lib/suricata/rules
-# and suricata.yaml expects it in /etc/suricata/rules or similar.
-# Typically, suricata.yaml is configured with `default-rule-path: /var/lib/suricata/rules/`
-# and `rule-files:` lists `suricata.rules`.
-# If `suricata.rules` is generated by suricata-update in `/var/lib/suricata/rules`, ensure config points there.
-# The provided suricata.yaml should have `default-rule-path: /etc/suricata/rules/`
-# and `rule-files: - suricata.rules`. So we copy the updated rules there.
+# Ensure rule directories exist (suricata-update needs /var/lib/suricata/rules)
+# /etc/suricata/rules is where suricata.yaml looks for local.rules and the main suricata.rules
+mkdir -p /var/lib/suricata/rules
+mkdir -p /etc/suricata/rules
+
+# Update Suricata rules using suricata-update
+# suricata-update uses the configuration file to determine rule paths and enabled/disabled rulesets.
+echo "Updating Suricata rules with suricata-update..." | tee -a "\${LOG_INIT_SURICATA}"
+suricata-update --suricata-conf "\${SURICATA_CONFIG_FILE_RUNTIME}" \
+    --no-enable-conf # Do not modify enable.conf, manage via suricata.yaml or local sources
+    # --no-disable-conf --no-modify-conf --no-drop-conf # These are less common to disable
+    # Add --force if needed to overwrite local modifications to downloaded rules, but generally not recommended.
+if [ $? -ne 0 ]; then
+    echo "WARNING: suricata-update failed. Suricata might start with stale or no rules from suricata-update." | tee -a "\${LOG_INIT_SURICATA}"
+fi
+
+# suricata-update typically downloads to /var/lib/suricata/rules/suricata.rules
+# The suricata.yaml is configured with default-rule-path: /etc/suricata/rules/
+# and rule-files: [suricata.rules, local.rules].
+# So, copy the updated rules to where suricata.yaml expects it.
 if [ -f "/var/lib/suricata/rules/suricata.rules" ]; then
     cp /var/lib/suricata/rules/suricata.rules /etc/suricata/rules/suricata.rules
-    echo "Copied updated suricata.rules to /etc/suricata/rules/"
+    echo "Copied updated suricata.rules to /etc/suricata/rules/" | tee -a "\${LOG_INIT_SURICATA}"
 else
-    echo "Warning: /var/lib/suricata/rules/suricata.rules not found after update."
+    echo "Warning: /var/lib/suricata/rules/suricata.rules not found after update. Check suricata-update output." | tee -a "\${LOG_INIT_SURICATA}"
 fi
 
-# Ensure custom local.rules is present in /etc/suricata/rules
+# Ensure custom local.rules exists (mounted from host or created empty)
 if [ ! -f "/etc/suricata/rules/local.rules" ]; then
-    touch /etc/suricata/rules/local.rules # Create if not mounted
+    echo "Creating empty /etc/suricata/rules/local.rules as it was not found (expected to be mounted)." | tee -a "\${LOG_INIT_SURICATA}"
+    touch /etc/suricata/rules/local.rules
 fi
 
-# Start Suricata
-echo "Starting Suricata..."
-exec suricata -c /tmp/suricata.yaml --af-packet="${SURICATA_INTERFACE}" -D \
-    --pidfile /var/run/suricata/suricata.pid \
-    && tail -F /var/log/suricata/suricata.log /var/log/suricata/eve.json
-# The -D makes it daemonize. For Docker, usually run in foreground.
-# Remove -D and adjust tailing or just let Suricata log to stdout.
-# For foreground:
-# exec suricata -c /tmp/suricata.yaml --af-packet="${SURICATA_INTERFACE}" -v --pidfile /var/run/suricata/suricata.pid
-# Let's run in foreground for easier Docker log management.
-# The following command will run suricata in foreground
-# Suricata logs to eve.json, filebeat picks it up. Stdout can be used for Suricata's own operational logs.
-# The -D makes it run in the background, which is not ideal for docker.
-# Correct command for foreground:
-# exec /usr/bin/suricata -c /tmp/suricata.yaml --af-packet="${SURICATA_INTERFACE}" --user=root --group=root -v
-# If suricata.yaml has eve.json configured for output, that's where alerts go.
-# We want suricata to run in foreground.
-# Using -v for verbosity, logs to console. EVE JSON logs to file for Filebeat.
-exec /usr/bin/suricata -c /tmp/suricata.yaml --af-packet="${SURICATA_INTERFACE}" --user=root --group=root -v
-# If pid file is needed by external tools, create the dir
-# mkdir -p /var/run/suricata && chown suricata:suricata /var/run/suricata
+# Start Suricata in the foreground for Docker logging
+# Using -v for verbosity. EVE JSON logs to file for Filebeat.
+# --user=root --group=root might be needed if running in a restrictive environment or with specific file permissions.
+# However, Suricata often drops privileges itself if not run as root.
+# If running privileged/host network, running as root initially is common.
+echo "Starting Suricata on interface \${SURICATA_INTERFACE}..." | tee -a "\${LOG_INIT_SURICATA}"
+exec /usr/bin/suricata -c "\${SURICATA_CONFIG_FILE_RUNTIME}" --af-packet="\${SURICATA_INTERFACE}" -v
+
 EOF
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD []
+# CMD is not needed as ENTRYPOINT execs Suricata

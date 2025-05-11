@@ -36,7 +36,7 @@ class AXLAPTUI:
             curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverse for selection
 
             self.config = self._load_config()
-            self.es_client = AXLAPElasticsearchClient(self.config)
+            self.es_client = ElasticsearchClient(self.config)
             self.arkime_client = ArkimeClient(self.config)
          #   self.opencti_client = OpenCTIClient(self.config)
 

@@ -30,3 +30,30 @@ services:
     image: docker.elastic.co/beats/filebeat:7.17.10
     container_name: axlap-filebeat
     user: root
+
+  ml_engine:
+    build:
+      context: . # Changed context to project root
+      dockerfile: dockerfiles/ml_engine/Dockerfile # Specified Dockerfile path from new context
+    container_name: axlap-ml-engine
+    volumes:
+      - ./src/ml_engine:/app/ml_engine:ro
+      - ./data/ml_models_data:/app/ml_engine/models # Persist trained models and scalers
+      - ./logs:/app/logs # For ML script logs
+    environment:
+      - ELASTICSEARCH_HOST=axlap-elasticsearch # Main ES for Zeek data
+      - ELASTICSEARCH_PORT=9200
+      - PYTHONUNBUFFERED=1 # Ensure Python script output is not buffered
+      # Pass other necessary ENV vars for training/prediction scripts if needed
+    networks:
+      - axlap_net
+    # This service is intended to be run on demand, e.g., `docker-compose run --rm ml_engine python ml_engine/train.py`
+    # No restart policy by default for on-demand services.
+
+networks:
+  axlap_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          # gateway: 172.28.0.1 # Optional: specify gateway for the subnet

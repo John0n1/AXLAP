@@ -1,33 +1,32 @@
 FROM ubuntu:22.04
 
-    ARG ARKIME_VERSION=4.2.0 # Specify Arkime version
-    ENV DEBIAN_FRONTEND=noninteractive
+ARG ARKIME_VERSION=4.2.0
+ENV DEBIAN_FRONTEND=noninteractive
 
-    RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
-        # Arkime Capture dependencies
         libpcap0.8 \
         libmaxminddb0 \
-        libyaml-0-2 \
-        # Other potential dependencies for plugins like yara, etc.
-        # libyara3 if yara plugin is used
-        && rm -rf /var/lib/apt/lists/*
+        libyaml-0-2 && \
+    # Add any other specific capture dependencies here, e.g., for yara if used by a plugin
+    # libyara-dev # Example if building yara from source or needing dev headers
+    rm -rf /var/lib/apt/lists/*
 
-    # Download and install Arkime DEB (same as viewer, it's a monolithic package)
-    RUN wget https://s3.amazonaws.com/files.molo.ch/builds/ubuntu-22.04/arkime_${ARKIME_VERSION}-1_amd64.deb -O /tmp/arkime.deb \
-        && apt-get update \
-        && apt-get install -y /tmp/arkime.deb \
-        && rm /tmp/arkime.deb
+# Download and install Arkime DEB package
+RUN wget "https://s3.amazonaws.com/files.molo.ch/builds/ubuntu-22.04/arkime_${ARKIME_VERSION}-1_amd64.deb" -O /tmp/arkime.deb && \
+    apt-get update && \
+    apt-get install -y /tmp/arkime.deb && \
+    rm /tmp/arkime.deb
 
-    # Ensure config directory exists (config.ini will be volume-mounted)
-    RUN mkdir -p /opt/arkime/etc
-    RUN mkdir -p /data/pcap # PCAP directory
+# Create necessary directories
+# Arkime package should create /opt/arkime/etc. /data/pcap is for PCAP storage.
+RUN mkdir -p /opt/arkime/etc && \
+    mkdir -p /data/pcap
 
-    WORKDIR /opt/arkime/bin
-    # Command is set in docker-compose.yml to use --dir for watching PCAP directory.
-    # Example: /opt/arkime/bin/arkime_capture -c /opt/arkime/etc/config.ini --dir /data/pcap
-    # If live capture:
-    # CMD ["/opt/arkime/bin/arkime_capture", "-c", "/opt/arkime/etc/config.ini"]
-    # For this project, the command is specified in docker-compose.yml, so we don't need an ENTRYPOINT.
-    # ENTRYPOINT ["/opt/arkime/bin/arkime_capture"]
+WORKDIR /opt/arkime/bin
+
+# No CMD or ENTRYPOINT needed here if the command is specified in docker-compose.yml
+# The docker-compose.yml specifies:
+# command: /opt/arkime/bin/arkime_capture -c /opt/arkime/etc/config.ini --dir /data/pcap
